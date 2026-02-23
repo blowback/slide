@@ -727,10 +727,10 @@ init_crc_table:
 .next_bit:
                 DJNZ	.bit_loop
 
-                ; store in table: low byte first, then high
-                LD	(HL), E
-                INC	HL
+                ; store in table: high byte first, then low
                 LD	(HL), D
+                INC	HL
+                LD	(HL), E
                 INC	HL
 
                 INC	C
