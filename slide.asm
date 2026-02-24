@@ -501,19 +501,16 @@ parse_filename
 
 .do_ext
                 ; pad remaining name chars with spaces
-                LD	A, ' '
-.pad_name2
-                LD	B, 0              ; check if we need padding
-                ; (DE already points to next FCB name slot)
-                ; calculate how many to pad
+                ; calculate how many slots remain before extension
                 PUSH	HL
                 LD	HL, FCB + 9
                 OR	A
                 SBC	HL, DE
                 LD	B, L              ; bytes to pad
                 POP	HL
+                LD	A, B
                 OR	A
-                JR	Z, .ext_start
+                JR	Z, .ext_start     ; no padding needed (name was 8 chars)
 .pad_n
                 LD	A, ' '
                 LD	(DE), A
