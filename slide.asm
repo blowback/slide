@@ -288,7 +288,9 @@ recv_frame
                 PUSH	HL              ; save buffer start
                 PUSH	BC              ; save length
 .recv_payload
+                PUSH	BC              ; save payload counter (uart_rx_timeout trashes B)
                 CALL	uart_rx_timeout
+                POP	BC              ; restore payload counter
                 JR	C, .payload_err
                 LD	(HL), A
                 INC	HL
@@ -307,6 +309,12 @@ recv_frame
 .payload_err
                 POP	BC
                 POP	HL
+                ; debug: print timeout indicator
+                PUSH    AF
+                LD	DE, msg_dbg_tmo
+                LD	C, C_WRITESTR
+                CALL    BDOS
+                POP     AF
                 SCF
                 RET
 
@@ -334,6 +342,41 @@ recv_frame
                 RET
 
 .crc_err
+                ; debug: print computed vs presentation CRCs
+                PUSH	HL
+                LD	DE, msg_dbg_crc
+                LD	C, C_WRITESTR
+                CALL    BDOS
+
+                ; print computed CRC
+                LD	HL, (crc_val)
+                LD	A, H
+                CALL    print_hex_a
+                LD	A, L
+                CALL    print_hex_a
+
+                ; space
+                LD	E, ' '
+                LD	C, C_WRITE
+                CALL    BDOS
+
+                ; print presentation CRC
+                LD	HL, (rx_crc)
+                LD	A, H
+                CALL    print_hex_a
+                LD	A, L
+                CALL    print_hex_a
+
+                ; CRLF
+                LD	E, 13
+                LD	C, C_WRITE
+                CALL    BDOS
+                LD	E, 10
+                LD	C, C_WRITE
+                CALL    BDOS
+
+                POP     HL
+
                 SCF
                 RET
 
@@ -768,6 +811,34 @@ init_crc_table
                 RET
 
 ; ============================================================================
+; Print A as two hex digits to console
+; ============================================================================
+print_hex_a
+                PUSH    AF
+                ; high nibble
+        .4	RRCA
+                AND     0xf        
+                CALL    .nibble
+                POP	AF
+                ; low nibble
+                AND	0x0F
+                CALL    .nibble
+                RET
+.nibble
+                CP      10
+                JR	C, .digit
+                ADD	A, 'A' - 10
+                JR      .out
+.digit
+                ADD	A, '0'
+.out
+                LD	E, A
+                LD	C, C_WRITE
+                CALL    BDOS
+                RET
+        
+
+; ============================================================================
 ; Messages
 ; ============================================================================
 msg_banner      DB	"SLIDE v0.1 - Waiting for transfer...", 13, 10, '$'
@@ -777,5 +848,6 @@ msg_err_file    DB	13, 10, "Error : can't create file", 13, 10, '$'
 msg_err_disk    DB	13, 10, "Error: disk write failed", 13, 10, '$'
 msg_dbg_ok      DB	13, 10, "DBG: header frame OK", 13, 10, '$'
 msg_dbg_fail    DB	13, 10, "DBG: recv_frame failed", 13, 10, '$'
-
+msg_dbg_crc     DB	"DBG: CRC mismatch cmp/prs: ", '$'
+msg_dbg_tmo     DB	"DBG: timeout in payload", 13, 10, '$'
                 END	entry
