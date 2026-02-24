@@ -191,10 +191,22 @@ uart_rx_timeout
 ; ============================================================================
 uart_tx
                 PUSH	AF
+                PUSH	BC
+                LD	B, 0              ; timeout counter (~330ms, same as rx)
+                LD	C, 0
 .wait
                 IN	A, (UART_LSR)
                 BIT	5, A             ; LSR_THRE
-                JR	Z, .wait
+                JR	NZ, .ready
+                DEC	C
+                JR	NZ, .wait
+                DEC	B
+                JR	NZ, .wait
+                POP	BC                ; timeout - discard byte
+                POP	AF
+                RET
+.ready
+                POP	BC
                 POP	AF
                 OUT	(UART_THR), A
                 RET
