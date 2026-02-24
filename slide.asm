@@ -33,6 +33,7 @@ CTRL_ACK        EQU	0x06             ; acknowledge
 CTRL_NAK        EQU	0x15             ; negative acknowledge
 CTRL_RDY        EQU	0x11             ; ready after disk flush
 CTRL_EOT        EQU	0x04             ; end of transfer (zero-length frame)
+CTRL_CAN        EQU	0x18             ; cancel (disk error)
 
 WIN_SIZE        EQU	4                ; sliding window size
 FRAME_SIZE      EQU	1024             ; payload bytes per frame
@@ -240,6 +241,14 @@ send_nak
 ; ============================================================================
 send_rdy
                 LD	A, CTRL_RDY
+                CALL	uart_tx
+                RET
+
+; ============================================================================
+; Send CAN (cancel - disk error)
+; ============================================================================
+send_can
+                LD	A, CTRL_CAN
                 CALL	uart_tx
                 RET
 
@@ -646,6 +655,7 @@ recv_file
                 JR	C, .no_flush
 
                 CALL	flush_to_disk
+                JR	C, .disk_error
                 LD	HL, RXBUF
                 LD	(buf_ptr), HL
                 LD	HL, 0
@@ -690,6 +700,11 @@ recv_file
                 CALL	BDOS
                 RET
 
+.disk_error
+                ; send CAN to tell PC to stop, then bail out
+                CALL	send_can
+                RET
+
 .end_of_file
                 ; flush any remaining data in buffer
                 LD	HL, (buf_used)
@@ -697,6 +712,7 @@ recv_file
                 OR	L
                 JR	Z, .eof_ack
                 CALL	flush_to_disk
+                JR	C, .disk_error
 
 .eof_ack
                 ; ACK the final frame
@@ -765,13 +781,14 @@ flush_to_disk
                 JR	.write_loop
 
 .write_done
+                OR	A                ; clear carry (success)
                 RET
 
 .write_err
-                ; print error and bail
                 LD	DE, msg_err_disk
                 LD	C, C_WRITESTR
                 CALL	BDOS
+                SCF                  ; set carry (error)
                 RET
 
 ; ============================================================================
