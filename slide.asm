@@ -38,6 +38,7 @@ FRAME_SIZE      EQU	1024             ; payload bytes per frame
 FLUSH_SIZE      EQU	WIN_SIZE * FRAME_SIZE ; 4KB - flush to disk threshold
 
 ; --- CP/M BDOS --------------------------------------------------------------
+IOBYTE          EQU     0x0003
 BDOS            EQU	0x0005
 FCB             EQU	0x005C
 DMA_ADDR        EQU	0x0080
@@ -61,6 +62,11 @@ CRC_TABLE       EQU	0x9000           ; 512 bytes for CRC-16-CCITT lookup table
                 ORG	0x0100           ; CP/M TPA
 
 entry:
+                ; stop the BIOS from using the UART
+                LD	A, 0b01010110   ; CON=BAT, RDR=PTR, LST=CRT
+                LD	HL, IOBYTE      ; TODO: use BDOS for this
+                LD	(HL), A
+
                 CALL	init_crc_table
                 CALL	uart_init
 
@@ -68,6 +74,9 @@ entry:
                 LD	DE, msg_banner
                 LD	C, C_WRITESTR
                 CALL	BDOS
+
+                ; send RDY to tell PC we're ready
+                CALL    send_rdy
 
                 ; wait for header frame (filename + filesize)
                 CALL	recv_header
@@ -244,10 +253,9 @@ recv_frame:
                 JR	NZ, .wait_sof
 
                 ; --- begin CRC over SEQ+LEN+PAYLOAD ---
-                LD	(crc_accum), HL   ; save dest ptr temporarily
+                LD	(frame_dst), HL   ; save dest ptr
                 LD	HL, 0xFFFF        ; CRC init value
                 LD	(crc_val), HL
-                LD	HL, (crc_accum)   ; restore dest ptr
 
                 ; receive SEQ
                 CALL	uart_rx_timeout
@@ -273,15 +281,19 @@ recv_frame:
                 OR	C
                 JR	Z, .recv_crc      ; no payload, just get CRC
 
-                ; receive payload bytes into (HL), length in BC
+                ; receive payload bytes into (frame_dst), length in BC
+                LD	HL, (frame_dst) ; restore dest ptr
                 PUSH	HL              ; save buffer start
                 PUSH	BC              ; save length
 .recv_payload:
                 CALL	uart_rx_timeout
                 JR	C, .payload_err
                 LD	(HL), A
-                CALL	crc_update_a
                 INC	HL
+                LD	(frame_dst), HL ; save updated ptr before CRC trashes HL
+                CALL	crc_update_a
+                LD	HL, (frame_dst) ; restore ptr
+
                 DEC	BC
                 LD	A, B
                 OR	C
@@ -329,6 +341,7 @@ rx_len:         DW	0
 rx_crc:         DW	0
 crc_val:        DW	0
 crc_accum:      DW	0
+frame_dst:      DW      0
 
 ; ============================================================================
 ; Receive header frame
@@ -744,7 +757,7 @@ init_crc_table:
 msg_banner:     DB	"SLIDE v0.1 - Waiting for transfer...", 13, 10, '$'
 msg_done:       DB	13, 10, "Transfer complete!", 13, 10, '$'
 msg_err_hdr:    DB	13, 10, "Error: bad header frame", 13, 10, '$'
-msg_err_file:   DB	13, 10, "Error: cannot create file", 13, 10, '$'
+msg_err_file:   DB	13, 10, "Error : can't create file", 13, 10,'$'
 msg_err_disk:   DB	13, 10, "Error: disk write failed", 13, 10, '$'
 
                 END	entry
