@@ -4,7 +4,7 @@
 ; Target: 8MHz Z80, TL16C550 UART with 16-byte FIFO, auto RTS/CTS flow control
 ; ============================================================================
 ; 
-                OUTPUT  slide.com
+                OUTPUT	slide.com
 
 ; --- UART hardware (16C550)
 UART_BASE       EQU	0x20             ; base I/O address
@@ -38,7 +38,7 @@ FRAME_SIZE      EQU	1024             ; payload bytes per frame
 FLUSH_SIZE      EQU	WIN_SIZE * FRAME_SIZE ; 4KB - flush to disk threshold
 
 ; --- CP/M BDOS --------------------------------------------------------------
-IOBYTE          EQU     0x0003
+IOBYTE          EQU	0x0003
 BDOS            EQU	0x0005
 FCB             EQU	0x005C
 DMA_ADDR        EQU	0x0080
@@ -49,6 +49,7 @@ F_DELETE        EQU	19
 F_WRITE         EQU	21
 F_SETDMA        EQU	26
 C_WRITESTR      EQU	9
+C_WRITE         EQU	2
 
 ; --- Memory layout -----------------------------------------------------------
 ; Adjust RXBUF to somewhere safe in TPA
@@ -61,8 +62,9 @@ CRC_TABLE       EQU	0x9000           ; 512 bytes for CRC-16-CCITT lookup table
 ; ============================================================================
                 ORG	0x0100           ; CP/M TPA
 
-entry:
+entry
                 ; stop the BIOS from using the UART
+                ; TODO: save the old value, restore it on exit
                 LD	A, 0b01010110   ; CON=BAT, RDR=PTR, LST=CRT
                 LD	HL, IOBYTE      ; TODO: use BDOS for this
                 LD	(HL), A
@@ -76,7 +78,7 @@ entry:
                 CALL	BDOS
 
                 ; send RDY to tell PC we're ready
-                CALL    send_rdy
+                CALL	send_rdy
 
                 ; wait for header frame (filename + filesize)
                 CALL	recv_header
@@ -103,13 +105,13 @@ entry:
 
                 RST	0                ; warm boot back to CP/M
 
-.err_header:
+.err_header
                 LD	DE, msg_err_hdr
                 LD	C, C_WRITESTR
                 CALL	BDOS
                 RST	0
 
-.err_file:
+.err_file
                 LD	DE, msg_err_file
                 LD	C, C_WRITESTR
                 CALL	BDOS
@@ -120,7 +122,7 @@ entry:
 ; Set up 16C650: 19200 baud, 8N1, FIFOs enabled, RTS/CTS flow control
 ; Adjust divisor for crystal/clock
 ; ============================================================================
-uart_init:
+uart_init
                 ; enable DLAB to set baud rate
                 LD	A, 0x83           ; DLAB=1, 8 data bits, 1 stop, no parity
                 OUT	(UART_LCR), A
@@ -155,7 +157,7 @@ uart_init:
 ; Returns: A = byte received
 ; Blocks until data available
 ; ============================================================================
-uart_rx:
+uart_rx
                 IN	A, (UART_LSR)
                 BIT	0, A             ; LSR_DR
                 JR	Z, uart_rx
@@ -168,11 +170,11 @@ uart_rx:
 ;          carry set on timeout
 ; Trashes: B (outer), D (inner counter)
 ; ============================================================================
-uart_rx_timeout:
+uart_rx_timeout
                 LD	B, 0              ; outer loop ~2 seconds at 8MHz
-.outer:
+.outer
                 LD	D, 0              ; inner loop
-.inner:
+.inner
                 IN	A, (UART_LSR)
                 BIT	0, A
                 JR	NZ, .got_byte
@@ -182,7 +184,7 @@ uart_rx_timeout:
                 JR	NZ, .outer
                 SCF                  ; timeout - set carry
                 RET
-.got_byte:
+.got_byte
                 IN	A, (UART_RBR)
                 OR	A                 ; clear carry
                 RET
@@ -191,9 +193,9 @@ uart_rx_timeout:
 ; Send a single byte via UART
 ; A = byte to send
 ; ============================================================================
-uart_tx:
+uart_tx
                 PUSH	AF
-.wait:
+.wait
                 IN	A, (UART_LSR)
                 BIT	5, A             ; LSR_THRE
                 JR	Z, .wait
@@ -205,7 +207,7 @@ uart_tx:
 ; Send ACK [seq]
 ; A = sequence number to acknowledge
 ; ============================================================================
-send_ack:
+send_ack
                 PUSH	AF
                 LD	A, CTRL_ACK
                 CALL	uart_tx
@@ -217,7 +219,7 @@ send_ack:
 ; Send NAK [seq]
 ; A = sequence number to request retransmit from
 ; ============================================================================
-send_nak:
+send_nak
                 PUSH	AF
                 LD	A, CTRL_NAK
                 CALL	uart_tx
@@ -228,7 +230,7 @@ send_nak:
 ; ============================================================================
 ; Send RDY
 ; ============================================================================
-send_rdy:
+send_rdy
                 LD	A, CTRL_RDY
                 CALL	uart_tx
                 RET
@@ -244,9 +246,9 @@ send_rdy:
 ;               BC = payload length (0 = end of transfer)
 ;           carry set = CRC error or timeout
 ; ============================================================================
-recv_frame:
+recv_frame
                 ; wait for SOF
-.wait_sof:
+.wait_sof
                 CALL	uart_rx_timeout
                 RET	C                ; timeout
                 CP	SOF
@@ -285,7 +287,7 @@ recv_frame:
                 LD	HL, (frame_dst) ; restore dest ptr
                 PUSH	HL              ; save buffer start
                 PUSH	BC              ; save length
-.recv_payload:
+.recv_payload
                 CALL	uart_rx_timeout
                 JR	C, .payload_err
                 LD	(HL), A
@@ -302,14 +304,14 @@ recv_frame:
                 POP	HL               ; restore buffer start
                 JR	.recv_crc
 
-.payload_err:
+.payload_err
                 POP	BC
                 POP	HL
                 SCF
                 RET
 
                 ; receive CRC (high byte first)
-.recv_crc:
+.recv_crc
                 CALL	uart_rx_timeout
                 RET	C
                 LD	(rx_crc + 1), A     ; expected CRC high
@@ -331,38 +333,52 @@ recv_frame:
                 OR	A                 ; clear carry
                 RET
 
-.crc_err:
+.crc_err
                 SCF
                 RET
 
 ; --- frame receive temporaries ---
-rx_seq:         DB	0
-rx_len:         DW	0
-rx_crc:         DW	0
-crc_val:        DW	0
-crc_accum:      DW	0
-frame_dst:      DW      0
+rx_seq          DB	0
+rx_len          DW	0
+rx_crc          DW	0
+crc_val         DW	0
+crc_accum       DW	0
+frame_dst       DW	0
 
 ; ============================================================================
 ; Receive header frame
 ; Header payload: null-terminated filename, then 4 bytes file size (little-endian)
 ; Returns: carry clear = success, carry set = error
 ; ============================================================================
-recv_header:
+recv_header
                 LD	HL, RXBUF         ; use start of buffer temporarily
                 CALL	recv_frame
-                RET	C
+                JR	C, .hdr_fail
+
+                ; print received seq and length for debug
+                LD	DE, msg_dbg_ok
+                LD	C, C_WRITESTR
+                CALL	BDOS
 
                 ; copy filename from RXBUF into FCB
-                ; (simplified: expects 8.3 uppercase, pad with spaces)
                 CALL	parse_filename
                 RET
+
+.hdr_fail
+                ; debug: print what went wrong
+                ; show first few bytes from UART to diagnose
+                LD	DE, msg_dbg_fail
+                LD	C, C_WRITESTR
+                CALL	BDOS
+                SCF
+                RET
+
 
 ; ============================================================================
 ; Parse filename from RXBUF into CP/M FCB at 0x005C
 ; Expects null-terminated "FILENAME.EXT" at RXBUF
 ; ============================================================================
-parse_filename:
+parse_filename
                 ; clear FCB
                 LD	HL, FCB
                 LD	DE, FCB + 1
@@ -378,7 +394,7 @@ parse_filename:
                 LD	HL, RXBUF
                 LD	DE, FCB + 1
                 LD	B, 8
-.copy_name:
+.copy_name
                 LD	A, (HL)
                 OR	A
                 JR	Z, .pad_name      ; end of string, no extension
@@ -389,7 +405,7 @@ parse_filename:
                 INC	DE
                 DJNZ	.copy_name
                 ; skip to '.' if name was 8 chars
-.find_dot:
+.find_dot
                 LD	A, (HL)
                 OR	A
                 JR	Z, .pad_done
@@ -398,18 +414,18 @@ parse_filename:
                 INC	HL
                 JR	.find_dot
 
-.pad_name:
+.pad_name
                 LD	A, ' '
-.pad_loop:
+.pad_loop
                 LD	(DE), A
                 INC	DE
                 DJNZ	.pad_loop
                 JR	.pad_done
 
-.do_ext:
+.do_ext
                 ; pad remaining name chars with spaces
                 LD	A, ' '
-.pad_name2:
+.pad_name2
                 LD	B, 0              ; check if we need padding
                 ; (DE already points to next FCB name slot)
                 ; calculate how many to pad
@@ -421,17 +437,17 @@ parse_filename:
                 POP	HL
                 OR	A
                 JR	Z, .ext_start
-.pad_n:
+.pad_n
                 LD	A, ' '
                 LD	(DE), A
                 INC	DE
                 DJNZ	.pad_n
 
-.ext_start:
+.ext_start
                 INC	HL               ; skip '.'
                 LD	DE, FCB + 9
                 LD	B, 3
-.copy_ext:
+.copy_ext
                 LD	A, (HL)
                 OR	A
                 JR	Z, .pad_ext
@@ -441,18 +457,18 @@ parse_filename:
                 DJNZ	.copy_ext
                 JR	.pad_done
 
-.pad_ext:
+.pad_ext
                 LD	A, ' '
-.pad_ext_loop:
+.pad_ext_loop
                 LD	(DE), A
                 INC	DE
                 DJNZ	.pad_ext_loop
 
-.pad_done:
+.pad_done
                 ; store file size (4 bytes after the null terminator)
                 ; find the null
                 LD	HL, RXBUF
-.find_null:
+.find_null
                 LD	A, (HL)
                 INC	HL
                 OR	A
@@ -465,13 +481,13 @@ parse_filename:
                 OR	A                 ; clear carry
                 RET
 
-file_size:      DW	0, 0             ; 32-bit file size
+file_size       DW	0, 0             ; 32-bit file size
 
 ; ============================================================================
 ; Create output file via CP/M BDOS
 ; Returns: carry set on error
 ; ============================================================================
-create_file:
+create_file
                 ; delete existing file (ignore error)
                 LD	DE, FCB
                 LD	C, F_DELETE
@@ -485,14 +501,14 @@ create_file:
                 JR	Z, .create_err
                 OR	A                 ; clear carry
                 RET
-.create_err:
+.create_err
                 SCF
                 RET
 
 ; ============================================================================
 ; Close file
 ; ============================================================================
-close_file:
+close_file
                 LD	DE, FCB
                 LD	C, F_CLOSE
                 CALL	BDOS
@@ -502,15 +518,15 @@ close_file:
 ; Main file receive loop
 ; Receives frames with sliding window, buffers in RAM, flushes to disk
 ; ============================================================================
-recv_file:
-                XOR	A
+recv_file
+                LD	A, 1            ; first data frame is seq 1 (0 was header)
                 LD	(expected_seq), A
                 LD	HL, RXBUF
                 LD	(buf_ptr), HL
                 LD	HL, 0
                 LD	(buf_used), HL
 
-.recv_loop:
+.recv_loop
                 ; calculate buffer position for next frame
                 LD	HL, (buf_ptr)
                 CALL	recv_frame
@@ -551,7 +567,7 @@ recv_file:
                 DEC	A                ; ACK the last received seq
                 CALL	send_ack
 
-.check_flush:
+.check_flush
                 ; check if buffer is full enough to flush
                 LD	HL, (buf_used)
                 LD	DE, FLUSH_SIZE
@@ -573,19 +589,19 @@ recv_file:
                 CALL	send_rdy
                 JR	.recv_loop
 
-.handle_error:
+.handle_error
                 ; CRC error or timeout - NAK the expected sequence
                 LD	A, (expected_seq)
                 CALL	send_nak
                 JR	.recv_loop
 
-.seq_error:
+.seq_error
                 ; out of sequence - NAK what we expected
                 LD	A, (expected_seq)
                 CALL	send_nak
                 JR	.recv_loop
 
-.end_of_file:
+.end_of_file
                 ; flush any remaining data in buffer
                 LD	HL, (buf_used)
                 LD	A, H
@@ -593,26 +609,26 @@ recv_file:
                 JR	Z, .eof_ack
                 CALL	flush_to_disk
 
-.eof_ack:
+.eof_ack
                 ; ACK the final frame
                 LD	A, (expected_seq)
                 CALL	send_ack
                 RET
 
 ; --- recv state ---
-expected_seq:   DB	0
-buf_ptr:        DW	RXBUF
-buf_used:       DW	0
+expected_seq    DB	0
+buf_ptr         DW	RXBUF
+buf_used        DW	0
 
 ; ============================================================================
 ; Flush buffer to disk via CP/M sequential writes
 ; Writes (buf_used) bytes from RXBUF in 128-byte records
 ; ============================================================================
-flush_to_disk:
+flush_to_disk
                 LD	HL, RXBUF
                 LD	DE, (buf_used)
 
-.write_loop:
+.write_loop
                 ; any data left?
                 LD	A, D
                 OR	E
@@ -654,10 +670,10 @@ flush_to_disk:
                 EX	DE, HL
                 JR	.write_loop
 
-.write_done:
+.write_done
                 RET
 
-.write_err:
+.write_err
                 ; print error and bail
                 LD	DE, msg_err_disk
                 LD	C, C_WRITESTR
@@ -673,7 +689,7 @@ flush_to_disk:
 ; Uses 512-byte lookup table for speed
 ; Modifies: crc_val
 ; Trashes: A, HL, DE
-crc_update_a:
+crc_update_a
                 PUSH	BC
                 LD	B, A              ; save input byte
 
@@ -703,11 +719,11 @@ crc_update_a:
 ; ============================================================================
 ; Build CRC-16-CCITT lookup table at CRC_TABLE (512 bytes)
 ; ============================================================================
-init_crc_table:
+init_crc_table
                 LD	HL, CRC_TABLE
                 LD	C, 0              ; byte index 0..255
 
-.table_loop:
+.table_loop
                 ; CRC = index << 8
                 LD	A, C
                 LD	D, A              ; D = high byte
@@ -715,7 +731,7 @@ init_crc_table:
 
                 ; process 8 bits
                 LD	B, 8
-.bit_loop:
+.bit_loop
                 ; test high bit of D
                 LD	A, D
                 AND	0x80
@@ -733,11 +749,11 @@ init_crc_table:
                 LD	E, A
                 JR	.next_bit
 
-.no_xor:
+.no_xor
                 SLA	E
                 RL	D
 
-.next_bit:
+.next_bit
                 DJNZ	.bit_loop
 
                 ; store in table: high byte first, then low
@@ -754,10 +770,12 @@ init_crc_table:
 ; ============================================================================
 ; Messages
 ; ============================================================================
-msg_banner:     DB	"SLIDE v0.1 - Waiting for transfer...", 13, 10, '$'
-msg_done:       DB	13, 10, "Transfer complete!", 13, 10, '$'
-msg_err_hdr:    DB	13, 10, "Error: bad header frame", 13, 10, '$'
-msg_err_file:   DB	13, 10, "Error : can't create file", 13, 10,'$'
-msg_err_disk:   DB	13, 10, "Error: disk write failed", 13, 10, '$'
+msg_banner      DB	"SLIDE v0.1 - Waiting for transfer...", 13, 10, '$'
+msg_done        DB	13, 10, "Transfer complete!", 13, 10, '$'
+msg_err_hdr     DB	13, 10, "Error: bad header frame", 13, 10, '$'
+msg_err_file    DB	13, 10, "Error : can't create file", 13, 10, '$'
+msg_err_disk    DB	13, 10, "Error: disk write failed", 13, 10, '$'
+msg_dbg_ok      DB	13, 10, "DBG: header frame OK", 13, 10, '$'
+msg_dbg_fail    DB	13, 10, "DBG: recv_frame failed", 13, 10, '$'
 
                 END	entry
