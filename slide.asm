@@ -27,6 +27,7 @@ LSR_DR          EQU	0x01             ; data ready
 LSR_THRE        EQU	0x20             ; transmit holding register empty
 
 ; --- Protocol constants -----------------------------------------------------
+MAX_RETRIES     EQU	30               ; ~10s before giving up (30 * 330ms timeout)
 SOF             EQU	0x01             ; start of frame
 CTRL_ACK        EQU	0x06             ; acknowledge
 CTRL_NAK        EQU	0x15             ; negative acknowledge
@@ -95,13 +96,8 @@ entry
                 ; main receive loop
                 CALL	recv_file
 
-                ; close file
+                ; close file (always, even on abort)
                 CALL	close_file
-
-                ; print done message
-                LD	DE, msg_done
-                LD	C, C_WRITESTR
-                CALL	BDOS
 
                 RST	0                ; warm boot back to CP/M
 
@@ -250,7 +246,7 @@ recv_frame
                 ; wait for SOF
 .wait_sof
                 CALL	uart_rx_timeout
-                RET	C                ; timeout
+                JP	C, .fail_sof
                 CP	SOF
                 JR	NZ, .wait_sof
 
@@ -261,19 +257,19 @@ recv_frame
 
                 ; receive SEQ
                 CALL	uart_rx_timeout
-                RET	C
+                JP	C, .fail_seq
                 LD	(rx_seq), A
                 CALL	crc_update_a
 
                 ; receive LEN_H
                 CALL	uart_rx_timeout
-                RET	C
+                JP	C, .fail_lenh
                 LD	(rx_len + 1), A     ; high byte
                 CALL	crc_update_a
 
                 ; receive LEN_L
                 CALL	uart_rx_timeout
-                RET	C
+                JP	C, .fail_lenl
                 LD	(rx_len), A       ; low byte
                 CALL	crc_update_a
 
@@ -321,11 +317,11 @@ recv_frame
                 ; receive CRC (high byte first)
 .recv_crc
                 CALL	uart_rx_timeout
-                RET	C
+                JR	C, .fail_crch
                 LD	(rx_crc + 1), A     ; expected CRC high
 
                 CALL	uart_rx_timeout
-                RET	C
+                JR	C, .fail_crcl
                 LD	(rx_crc), A       ; expected CRC low
 
                 ; compare computed CRC with received CRC
@@ -379,6 +375,32 @@ recv_frame
 
                 SCF
                 RET
+
+; --- debug: print char in A then set carry and return ---
+.dbg_fail_ret
+                LD	E, A
+                LD	C, C_WRITE
+                CALL	BDOS
+                SCF
+                RET
+.fail_sof
+                LD	A, 'S'
+                JR	.dbg_fail_ret
+.fail_seq
+                LD	A, '1'
+                JR	.dbg_fail_ret
+.fail_lenh
+                LD	A, '2'
+                JR	.dbg_fail_ret
+.fail_lenl
+                LD	A, '3'
+                JR	.dbg_fail_ret
+.fail_crch
+                LD	A, '4'
+                JR	.dbg_fail_ret
+.fail_crcl
+                LD	A, '5'
+                JR	.dbg_fail_ret
 
 ; --- frame receive temporaries ---
 rx_seq          DB	0
@@ -575,13 +597,19 @@ recv_file
                 CALL	recv_frame
                 JR	C, .handle_error
 
+                ; save seq before zero-length check clobbers A
+                LD	D, A              ; D = received seq
+
+                ; frame received - reset retry counter
+                XOR	A
+                LD	(retry_count), A
+
                 ; check for end of transfer (zero-length frame)
                 LD	A, B
                 OR	C
                 JR	Z, .end_of_file
 
                 ; verify sequence number
-                LD	D, A              ; D = received seq
                 LD	A, (expected_seq)
                 CP	D
                 JR	NZ, .seq_error
@@ -601,39 +629,41 @@ recv_file
                 INC	A
                 LD	(expected_seq), A
 
-                ; check if we should ACK (every WIN_SIZE frames)
-                AND	WIN_SIZE - 1     ; assumes WIN_SIZE is power of 2
-                JR	NZ, .check_flush
-
-                ; send ACK
-                LD	A, (expected_seq)
-                DEC	A                ; ACK the last received seq
-                CALL	send_ack
-
-.check_flush
-                ; check if buffer is full enough to flush
+                ; flush before ACK so PC doesn't send during disk I/O
                 LD	HL, (buf_used)
                 LD	DE, FLUSH_SIZE
                 OR	A
                 SBC	HL, DE
-                JR	C, .recv_loop     ; not full yet
+                JR	C, .no_flush
 
-                ; flush buffer to disk
-                ; auto RTS/CTS will pause PC if FIFO fills during flush
                 CALL	flush_to_disk
-
-                ; reset buffer
                 LD	HL, RXBUF
                 LD	(buf_ptr), HL
                 LD	HL, 0
                 LD	(buf_used), HL
 
-                ; signal ready for more
-                CALL	send_rdy
+.no_flush
+                ; ACK every WIN_SIZE frames
+                LD	A, (expected_seq)
+                DEC	A                ; A = last received seq
+                AND	WIN_SIZE - 1     ; 0 when seq is multiple of WIN_SIZE
+                JR	NZ, .recv_loop
+
+                ; send ACK (after any flush is complete)
+                LD	A, (expected_seq)
+                DEC	A
+                CALL	send_ack
                 JR	.recv_loop
 
 .handle_error
-                ; CRC error or timeout - NAK the expected sequence
+                ; CRC error or timeout - check retry limit
+                LD	A, (retry_count)
+                INC	A
+                LD	(retry_count), A
+                CP	MAX_RETRIES
+                JR	NC, .abort
+
+                ; NAK the expected sequence
                 LD	A, (expected_seq)
                 CALL	send_nak
                 JR	.recv_loop
@@ -643,6 +673,13 @@ recv_file
                 LD	A, (expected_seq)
                 CALL	send_nak
                 JR	.recv_loop
+
+.abort
+                ; too many retries - give up
+                LD	DE, msg_err_abort
+                LD	C, C_WRITESTR
+                CALL	BDOS
+                RET
 
 .end_of_file
                 ; flush any remaining data in buffer
@@ -656,12 +693,17 @@ recv_file
                 ; ACK the final frame
                 LD	A, (expected_seq)
                 CALL	send_ack
+
+                LD	DE, msg_done
+                LD	C, C_WRITESTR
+                CALL	BDOS
                 RET
 
 ; --- recv state ---
 expected_seq    DB	0
 buf_ptr         DW	RXBUF
 buf_used        DW	0
+retry_count     DB	0
 
 ; ============================================================================
 ; Flush buffer to disk via CP/M sequential writes
@@ -850,4 +892,5 @@ msg_dbg_ok      DB	13, 10, "DBG: header frame OK", 13, 10, '$'
 msg_dbg_fail    DB	13, 10, "DBG: recv_frame failed", 13, 10, '$'
 msg_dbg_crc     DB	"DBG: CRC mismatch cmp/prs: ", '$'
 msg_dbg_tmo     DB	"DBG: timeout in payload", 13, 10, '$'
+msg_err_abort   DB	13, 10, "Transfer aborted - connection lost", 13, 10, '$'
                 END	entry
