@@ -21,20 +21,21 @@ LS_OPTS = $(CPM_DISK_TYPE)
 
 # NB TARGET set by OUTPUT directive in .asm file
 ASM_FILES = $(wildcard *.asm)
-TARGET = slide.com
-LISTING = slide.lst
 
-all: $(TARGET)
+all: slide slidiag
 
 build: all
 
-$(TARGET): $(ASM_FILES)
-	$(SJASMPLUS) --nologo --lst=$(LISTING) $^
+slide: slide.asm
+	$(SJASMPLUS) --nologo --lst=slide.lst $^
+
+slidiag: slidiag.asm
+	$(SJASMPLUS) --nologo --lst=slidiag.lst $^
 
 clean:
-	rm -f $(TARGET) $(LISTING)
+	rm -f slide.com slidiag.com slide.lst slidiag.lst
 
-disk: $(TARGET)
+disk: slide.com slidiag.com
 	$(MKFS) $(MKFSOPTS) $(CPM_IMAGE)
 	$(CP) $(CP_OPTS) $(CPM_IMAGE) slide.com 0:slide.com
 	$(CP) $(CP_OPTS) $(CPM_IMAGE) slidiag.com 0:slidiag.com
