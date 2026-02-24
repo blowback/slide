@@ -27,7 +27,7 @@ LSR_DR          EQU	0x01             ; data ready
 LSR_THRE        EQU	0x20             ; transmit holding register empty
 
 ; --- Protocol constants -----------------------------------------------------
-MAX_RETRIES     EQU	30               ; ~10s before giving up (30 * 330ms timeout)
+MAX_RETRIES     EQU	15               ; ~10s before giving up (15 * 660ms per cycle)
 SOF             EQU	0x01             ; start of frame
 CTRL_ACK        EQU	0x06             ; acknowledge
 CTRL_NAK        EQU	0x15             ; negative acknowledge
