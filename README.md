@@ -2,9 +2,11 @@
 
 File transfer from PC to MicroBeast (Z80! CP/M!) over a serial link. Sliding window protocol with CRC-16 error detection and hardware flow control.
 
+95%+ link utilisation for files > 1K. CP/M binary is 1.3 KBytes.
+
 Other Z80 based computers are available, and might work with a bit of fiddling about. IO ports and baud rates and such.
 
-## Z80 side
+## BEAST side
 
 Build with sjasmplus:
 
