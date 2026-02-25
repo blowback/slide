@@ -106,12 +106,14 @@ entry
                 LD	DE, msg_err_hdr
                 LD	C, C_WRITESTR
                 CALL	BDOS
+                CALL	send_can
                 RST	0
 
 .err_file
                 LD	DE, msg_err_file
                 LD	C, C_WRITESTR
                 CALL	BDOS
+                CALL	send_can
                 RST	0
 
 ; ============================================================================
@@ -757,15 +759,21 @@ flush_to_disk
                 ; write one 128-byte record
                 PUSH	HL
                 PUSH	DE
+                LD	A, (FCB + 32)    ; save current record before write
+                PUSH	AF
                 LD	DE, FCB
                 LD	C, F_WRITE
                 CALL	BDOS
+                POP	BC               ; B = old current record
                 POP	DE
                 POP	HL
 
-                ; check for write error
+                ; check for write error (BDOS return or record didn't advance)
                 OR	A
                 JR	NZ, .write_err
+                LD	A, (FCB + 32)
+                CP	B
+                JR	Z, .write_err    ; record didn't advance = silent failure
 
                 ; advance 128 bytes
                 LD	BC, 128
