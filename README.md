@@ -1,6 +1,6 @@
 # SLIDE - Serial Line Inter-Device (file) Exchange
 
-File transfer from PC to MicroBeast (Z80! CP/M!) over a serial link. Sliding window protocol with CRC-16 error detection and hardware flow control.
+File transfer from PC to the [FeerSum Beasts MicroBeast Z80 Computer](https://feersumbeasts.com/microbeast.html) (Z80! CP/M!) over a serial link. Sliding window protocol with CRC-16 error detection and hardware flow control.
 
 95%+ link utilisation for files > 1K. CP/M binary is 1.3 KBytes.
 
