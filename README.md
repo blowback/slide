@@ -1,6 +1,8 @@
 # SLIDE - Serial Line Inter-Device (file) Exchange
 
-File transfer from PC to Z80/CP/M over a serial link. Sliding window protocol with CRC-16 error detection and hardware flow control.
+File transfer from PC to MicroBeast (Z80! CP/M!) over a serial link. Sliding window protocol with CRC-16 error detection and hardware flow control.
+
+Other Z80 based computers are available, and might work with a bit of fiddling about. IO ports and baud rates and such.
 
 ## Z80 side
 
@@ -15,6 +17,8 @@ Copy `slide.com` to a CP/M disk and run:
 ```
 A> SLIDE
 ```
+
+Or, you can `make disk` (you'll need cpmtools) and transfer  `slide_p25.img` to your system using whchever inferior serial transfer tools you are currently having to tolerate.
 
 SLIDE waits up to ~30 seconds for the PC to connect.
 
