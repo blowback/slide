@@ -1,5 +1,5 @@
 # Makefile for SLIDE
-BEAST_DIR = /home/ant/src/microbeast
+BEAST_DIR = $(HOME)/src/microbeast
 SJASMPLUS_DIR = $(BEAST_DIR)/sjasmplus
 CPMTOOLS_DIR = $(BEAST_DIR)/cpmtools-2.23
 
