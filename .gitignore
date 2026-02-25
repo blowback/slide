@@ -1,3 +1,11 @@
 *.lst
 *.com
 *.img
+__pycache__/
+*.pyc
+.venv/
+TEST*.dat
+TEST32
+*.tar.gz
+*.tar.bz2
+*.zip
