@@ -79,12 +79,22 @@ entry
                 LD	C, C_WRITESTR
                 CALL	BDOS
 
-                ; send RDY to tell PC we're ready
+                ; send RDY and wait for header, retrying until PC connects
+                LD	E, 15            ; ~30 seconds (15 x ~2s timeout)
+.wait_pc
                 CALL	send_rdy
-
-                ; wait for header frame (filename + filesize)
                 CALL	recv_header
-                JR	C, .err_header
+                JR	NC, .got_header
+                ; timeout — PC not connected yet, try again
+                CALL	uart_flush_rx
+                DEC	E
+                JR	NZ, .wait_pc
+                ; gave up waiting
+                LD	DE, msg_err_hdr
+                LD	C, C_WRITESTR
+                CALL	BDOS
+                RST	0
+.got_header
 
                 ; create output file
                 CALL	create_file
@@ -245,6 +255,17 @@ send_rdy
                 LD	A, CTRL_RDY
                 CALL	uart_tx
                 RET
+
+; ============================================================================
+; Flush UART receive FIFO (drain any stale bytes)
+; ============================================================================
+uart_flush_rx
+.flush_loop
+                IN	A, (UART_LSR)
+                BIT	0, A             ; data ready?
+                RET	Z                ; no more data
+                IN	A, (UART_RBR)    ; read and discard
+                JR	.flush_loop
 
 ; ============================================================================
 ; Send CAN (cancel - disk error)
