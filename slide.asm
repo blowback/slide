@@ -66,9 +66,12 @@ CRC_TABLE       EQU	0x9000           ; 512 bytes for CRC-16-CCITT lookup table
 
 entry
                 ; stop the BIOS from using the UART
-                ; TODO: save the old value, restore it on exit
+                LD	HL, IOBYTE      ; save current iobyte
+                LD	A, (HL)
+                LD	DE, iobyte_saved
+                LD	(DE), A
+
                 LD	A, 0b01010110   ; CON=BAT, RDR=PTR, LST=CRT
-                LD	HL, IOBYTE      ; TODO: use BDOS for this
                 LD	(HL), A
 
                 CALL	init_crc_table
@@ -93,7 +96,7 @@ entry
                 LD	DE, msg_err_hdr
                 LD	C, C_WRITESTR
                 CALL	BDOS
-                RST	0
+                JR	.out
 .got_header
 
                 ; create output file
@@ -110,21 +113,31 @@ entry
                 ; close file (always, even on abort)
                 CALL	close_file
 
-                RST	0                ; warm boot back to CP/M
+                JR	.out
 
 .err_header
                 LD	DE, msg_err_hdr
                 LD	C, C_WRITESTR
                 CALL	BDOS
                 CALL	send_can
-                RST	0
+                JR	.out
 
 .err_file
                 LD	DE, msg_err_file
                 LD	C, C_WRITESTR
                 CALL	BDOS
                 CALL	send_can
-                RST	0
+                JR	.out
+
+.out            ; restore original IOBYTE
+                LD	HL, iobyte_saved
+                LD	DE, IOBYTE
+                LD	A, (HL)
+                LD	(DE), A
+                
+                RST	0               ; warm start back to cp/m
+
+iobyte_saved    db      0
 
 ; ============================================================================
 ; UART initialisation
