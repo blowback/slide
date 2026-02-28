@@ -766,9 +766,13 @@ recv_session
 
                 ; receive file data
                 CALL	recv_file
+                PUSH	AF              ; save error flag
 
-                ; close file
+                ; close file (always, even on error)
                 CALL	close_file
+
+                POP	AF
+                JR	C, .file_error  ; recv_file failed — exit session
 
                 ; reset state for next file
                 LD	A, 1
@@ -789,6 +793,10 @@ recv_session
                 LD	DE, msg_done_session
                 LD	C, C_WRITESTR
                 CALL	BDOS
+                RET
+
+.file_error
+                ; recv_file already printed error and sent CAN — just exit
                 RET
 
 .err_header
@@ -900,10 +908,12 @@ recv_file
                 LD	DE, msg_err_abort
                 LD	C, C_WRITESTR
                 CALL	BDOS
+                SCF                  ; signal error to caller
                 RET
 
 .disk_error
                 CALL	send_can
+                SCF                  ; signal error to caller
                 RET
 
 .end_of_file
@@ -921,6 +931,7 @@ recv_file
                 LD	DE, msg_done
                 LD	C, C_WRITESTR
                 CALL	BDOS
+                OR	A                ; clear carry = success
                 RET
 
 ; --- recv state ---
