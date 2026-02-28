@@ -265,6 +265,7 @@ uart_rx_timeout
 
 ; Send a single byte via UART (with ~330ms timeout for CTS)
 ; A = byte to send.  Preserves all registers.
+; On timeout: sets (tx_fail) flag (checked by send_frame)
 uart_tx
                 PUSH	AF
                 PUSH	BC
@@ -278,6 +279,9 @@ uart_tx
                 JR	NZ, .wait
                 DEC	B
                 JR	NZ, .wait
+                ; timeout — set failure flag
+                LD	A, 1
+                LD	(tx_fail), A
                 POP	BC
                 POP	AF
                 RET
@@ -286,6 +290,8 @@ uart_tx
                 POP	AF
                 OUT	(UART_THR), A
                 RET
+
+tx_fail         DB	0
 
 ; Flush UART receive FIFO
 uart_flush_rx
@@ -1235,6 +1241,10 @@ send_file_tx
                 JR	.send_window
 
 .tx_timeout
+                ; if uart_tx failed, PC is gone — abort immediately
+                LD	A, (tx_fail)
+                OR	A
+                JR	NZ, .tx_abort
                 LD	A, (tx_retry)
                 INC	A
                 LD	(tx_retry), A
@@ -1275,6 +1285,11 @@ send_window_from_buf
                 LD	DE, (tx_chunk_len)
 
 .frame_loop
+                ; bail out if uart_tx failed (PC disconnected)
+                LD	A, (tx_fail)
+                OR	A
+                RET	NZ
+
                 ; any data left?
                 LD	A, D
                 OR	E
@@ -1341,6 +1356,10 @@ send_frame
                 LD	(tx_frame_ptr), HL
                 LD	(tx_frame_len), BC
 
+                ; clear tx failure flag
+                XOR	A
+                LD	(tx_fail), A
+
                 ; init CRC
                 LD	HL, 0xFFFF
                 LD	(crc_val), HL
@@ -1377,6 +1396,10 @@ send_frame
 .sf_payload
                 LD	A, (HL)
                 CALL	uart_tx
+                ; bail out if uart_tx timed out (PC disconnected)
+                LD	A, (tx_fail)
+                OR	A
+                JR	NZ, .sf_crc     ; skip rest, CRC will be wrong but don't care
                 LD	A, (HL)         ; reload (uart_tx preserves AF but crc trashes A)
                 PUSH	HL
                 PUSH	BC
