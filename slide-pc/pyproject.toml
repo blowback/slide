@@ -1,6 +1,6 @@
 [project]
 name = "slide"
-version = "0.1.0"
+version = "0.2.0"
 description = "SLIDE - Serial Line Inter-Device (file) Exchange"
 requires-python = ">=3.10"
 dependencies = [
@@ -9,6 +9,7 @@ dependencies = [
 
 [project.scripts]
 slide-send = "slide.send:main"
+slide-recv = "slide.recv:main"
 
 [build-system]
 requires = ["hatchling"]
