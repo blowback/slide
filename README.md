@@ -64,6 +64,21 @@ Look at the pretty:
 
 ![Transfer example](images/transfer.png)
 
+If you want to **receive** files on the PC end:
+
+```
+slide recv /dev/ttyUSB0
+
+```
+
+or 
+
+```
+slide recv --output-dir SOMEDIR /dev/ttyUSB0
+```
+
+and type `slide s FOO.DAT` on the 'beast.
+
 If you want to know all the options, `slide --help` has got you covered.
 
 ### Shonky Python scripts
