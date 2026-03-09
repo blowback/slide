@@ -1,0 +1,12 @@
+[package]
+name = "slide"
+version = "0.2.0"
+edition = "2021"
+description = "SLIDE - Serial Line Inter-Device file Exchange"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serialport = "4"
+indicatif = "0.17"
+console = "0.15"
+anyhow = "1"
