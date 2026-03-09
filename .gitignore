@@ -10,3 +10,4 @@ TEST32
 *.tar.bz2
 *.zip
 CONTEXT.md
+slide-rs/target/
