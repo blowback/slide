@@ -1,12 +1,14 @@
 # SLIDE - Serial Line Inter-Device (file) Exchange
 
-File transfer from PC to the [FeerSum Beasts MicroBeast Z80 Computer](https://feersumbeasts.com/microbeast.html) (Z80! CP/M!) over a serial link. Sliding window protocol with CRC-16 error detection and hardware flow control.
+File transfer from PC to the [FeerSum Beasts MicroBeast Z80 Computer](https://feersumbeasts.com/microbeast.html) (Z80! CP/M!) over a serial link.
 
-95%+ link utilisation for files > 1K. CP/M binary is 1.3 KBytes.
+Sliding window protocol with CRC-16 error detection and hardware flow control.
+
+95%+ link utilisation for files > 2K. CP/M binary is 1.3 KBytes.
 
 Other Z80 based computers are available, and might work with a bit of fiddling about. IO ports and baud rates and such.
 
-## BEAST side
+## MicroBeast side
 
 Build with sjasmplus:
 
@@ -20,11 +22,51 @@ Copy `slide.com` to a CP/M disk and run:
 A> SLIDE
 ```
 
-Or, you can `make disk` (you'll need cpmtools) and transfer  `slide_p25.img` to your system using whchever inferior serial transfer tools you are currently having to tolerate.
+Or, you can `make disk` (you'll need cpmtools) and transfer  `slide_p25.img` to your system using whichever inferior serial transfer tools you are currently having to tolerate.
 
-SLIDE waits up to ~30 seconds for the PC to connect.
+SLIDE waits up to ~30 seconds for the PC to connect. `slide send /dev/ttyUSB0 TEST1K.dat` on the PC end will kick off a transfer.
+
+`SLIDE` is an alias for `SLIDE R` ("slide receive") - meaning that the MicroBeast will download and save any files sent from the PC side.
+
+You can also **send** files from the MicroBeast:
+
+```
+A> SLIDE S TEST1K.DAT
+```
+
+On the PC side the corresponding command is `slide recv /dev/ttyUSB0` to start receiving the files. They'll go in the current directory: you can specify the option `--output-dir SOMEDIR` to change that.
 
 ## PC side
+
+You've got a couple of options here, you can either use the all-singing, all-dancing unified Rust binary, or you can mess about with the original shonky Python scripts.
+
+### Unified rust binary
+
+To build the `slide` executable for your system, change into the `slide-rs` directory and type `cargo build --release`.  This will net you a binary in `target/release/slide` that you can copy to somewhere on your PATH (I stick it in `~/.local/bin`).
+
+Then to send a single file:
+
+```
+slide send /dev/ttyUSB0 TEST1K.dat
+```
+
+and type `slide` on the MicroBeast to get things going.
+
+To send multiple files:
+
+```
+slide send /dev/ttyUSB0 TEST1K.DAT TEST{1,2,4,8,16,32,64}K.dat
+```
+
+and type `slide` on the MicroBeast to get things going.
+
+Look at the pretty:
+
+![Transfer example](images/transfer.png)
+
+If you want to know all the options, `slide --help` has got you covered.
+
+### Shonky Python scripts
 
 Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/):
 
@@ -80,3 +122,4 @@ YMMV, but I've tried:
 ## Things I've not tested
 
 - target file exists and is read-only (need to figure out the `stat` runes)
+- building slide-rs on MacOS or... Windows lol
