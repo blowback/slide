@@ -6,6 +6,7 @@
 ; Usage:  SLIDE              — receive mode (default)
 ;         SLIDE R            — receive mode (explicit)
 ;         SLIDE S FILE.COM   — send FILE.COM to PC
+;         SLIDE S A.COM B.DAT — send multiple files
 ; ============================================================================
 ;
                 OUTPUT	slide.com
@@ -173,28 +174,77 @@ parse_cmdline
                 RET                 ; "S " with no filename
 
 .got_fname
-                ; copy filename to send_fname (null-terminated, max 12 chars)
-                LD	DE, send_fname
-                LD	C, 12           ; max filename length
-.copy_fname
+                ; copy remaining command tail (all filenames) to safe buffer
+                ; HL = pointer to first filename char, B = remaining chars
+                LD	DE, cmdtail_buf
+.copy_tail
                 LD	A, (HL)
-                CP	' '
-                JR	Z, .fname_done
-                OR	A
-                JR	Z, .fname_done
                 LD	(DE), A
                 INC	HL
                 INC	DE
-                DEC	C
-                JR	Z, .fname_done  ; truncate at 12
-                DJNZ	.copy_fname
-.fname_done
+                DJNZ	.copy_tail
                 XOR	A
                 LD	(DE), A         ; null terminate
+                ; init pointer to start of buffer
+                LD	HL, cmdtail_buf
+                LD	(cmdtail_pos), HL
                 RET
 
 mode            DB	0               ; 0=receive, 1=send
 send_fname      DS	13              ; null-terminated filename for send mode
+cmdtail_buf     DS	128             ; saved command tail (filenames)
+cmdtail_pos     DW	0               ; current position in cmdtail_buf
+
+; ============================================================================
+; next_send_fname — extract next filename from cmdtail_buf into send_fname
+; Returns: NZ if filename found, Z if no more filenames
+; ============================================================================
+next_send_fname
+                LD	HL, (cmdtail_pos)
+                ; skip spaces
+.skip_sp
+                LD	A, (HL)
+                OR	A
+                JR	Z, .no_more     ; end of buffer
+                CP	' '
+                JR	NZ, .got_name
+                INC	HL
+                JR	.skip_sp
+
+.got_name
+                ; copy filename to send_fname (max 12 chars)
+                LD	DE, send_fname
+                LD	C, 12
+.copy_name
+                LD	A, (HL)
+                OR	A
+                JR	Z, .name_done
+                CP	' '
+                JR	Z, .name_done
+                LD	(DE), A
+                INC	HL
+                INC	DE
+                DEC	C
+                JR	NZ, .copy_name
+                ; if we hit 12, skip remaining non-space chars
+.skip_rest
+                LD	A, (HL)
+                OR	A
+                JR	Z, .name_done
+                CP	' '
+                JR	Z, .name_done
+                INC	HL
+                JR	.skip_rest
+.name_done
+                LD	(cmdtail_pos), HL
+                XOR	A
+                LD	(DE), A         ; null terminate send_fname
+                OR	1               ; set NZ — got a filename
+                RET
+
+.no_more
+                XOR	A               ; set Z — no more filenames
+                RET
 
 ; ============================================================================
 ; UART initialisation
@@ -1008,9 +1058,9 @@ flush_to_disk
                 RET
 
 ; ============================================================================
-; SEND SESSION (multi-file — currently single file from command line)
+; SEND SESSION (multi-file from command line)
 ; Handshake: Z80 (sender) sends RDY, waits for PC's RDY echo.
-; Then: open file → send_file_tx → close → send FIN, wait for FIN echo.
+; Then: for each file: open → send_file_tx → close. After all files: FIN exchange.
 ; ============================================================================
 send_session
                 ; --- Handshake: sender sends RDY, waits for PC's RDY echo ---
@@ -1035,6 +1085,11 @@ send_session
 
 .pc_ready
                 CALL	uart_flush_rx
+
+                ; --- File loop: send each file from command line ---
+.next_file
+                CALL	next_send_fname
+                JR	Z, .all_sent    ; no more filenames
 
                 ; --- Set up FCB from send_fname ---
                 ; Copy send_fname into RXBUF so parse_filename can use it
@@ -1067,6 +1122,9 @@ send_session
                 ; close file
                 CALL	close_file
 
+                JR	.next_file      ; loop for next file
+
+.all_sent
                 ; --- Send FIN, wait for echo ---
                 CALL	send_fin
                 ; wait for FIN echo (brief timeout)
@@ -1082,7 +1140,8 @@ send_session
                 LD	DE, msg_err_open
                 LD	C, C_WRITESTR
                 CALL	BDOS
-                RET
+                ; continue with remaining files
+                JR	.next_file
 
 ; ============================================================================
 ; Compute file size using BDOS function 35
