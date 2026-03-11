@@ -22,7 +22,10 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/z00m128/sjasmplus.git  --recurse-submodules # --branch v1.21.1
           cd sjasmplus && make && sudo make install
-
+          
+      - name: Install cpmtools
+        run: sudo apt-get install -y cpmtools
+        
       - name: Assemble Z80 binary
         run: sjasmplus slide.asm --raw=slide.com
 
