@@ -1,5 +1,7 @@
 # SLIDE - Serial Line Inter-Device (file) Exchange
 
+![Transfer example](images/slide.png)
+
 File transfer from PC to the [FeerSum Beasts MicroBeast Z80 Computer](https://feersumbeasts.com/microbeast.html) (Z80! CP/M!) over a serial link.
 
 Sliding window protocol with CRC-16 error detection and hardware flow control.
