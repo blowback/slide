@@ -20,7 +20,7 @@ jobs:
       - name: Install sjasmplus
         # run: sudo apt-get install -y sjasmplus
         run: |
-          git clone --depth 1 https://github.com/z00m128/sjasmplus.git # --branch v1.21.1
+          git clone --depth 1 https://github.com/z00m128/sjasmplus.git  --recurse-submodules # --branch v1.21.1
           cd sjasmplus && make && sudo make install
 
       - name: Assemble Z80 binary
