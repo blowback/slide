@@ -127,6 +127,7 @@ jobs:
 
       # linux and macos binaries both called "slide" which causes some bother...
       - name: Rename binary for release
+        shell: bash # yes, even on windows
         run: |
           cp slide-rs/target/release/${{ matrix.binary }} \
              ${{ env.BINARY_NAME }}-${{ matrix.suffix }}${{ matrix.ext }}
