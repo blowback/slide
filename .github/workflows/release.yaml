@@ -138,6 +138,6 @@ jobs:
             ${{ env.BINARY_NAME }}-linux-amd64/${{ env.BINARY_NAME }}
             ${{ env.BINARY_NAME }}-windows-amd64/${{ env.BINARY_NAME }}.exe
             ${{ env.BINARY_NAME }}-macos-amd64/${{ env.BINARY_NAME }}
-            z80-binary/${{BINARY_NAME}}.com
-            cpm-disk-image/${{BINARY_NAME}}_p25.img
+            z80-binary/${{ env.BINARY_NAME }}.com
+            cpm-disk-image/${{ env.BINARY_NAME }}_p25.img
 
