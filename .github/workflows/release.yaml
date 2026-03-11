@@ -26,12 +26,17 @@ jobs:
       - name: Install cpmtools
         run: sudo apt-get install -y cpmtools
         
-      - name: Assemble Z80 binary
-        run: sjasmplus slide.asm --raw=slide.com
+      #- name: Assemble Z80 binary
+      #  run: sjasmplus slide.asm --raw=slide.com
 
-      - name: Build disk image
+      #- name: Build disk image
+      #  run: make disk CPMTOOLS_DIR=/usr/bin
+
+      - name: Assemble Z80 binary & build disk image
         run: make disk CPMTOOLS_DIR=/usr/bin
 
+      #- name: Build disk image
+      #  run: make disk CPMTOOLS_DIR=/usr/bin
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
@@ -116,11 +121,12 @@ jobs:
       #  if: matrix.os == 'macos-latest'
       #  run: |
       #    xcrun stapler staple slide-rs/target/release/${{ env.BINARY_NAME }}
-      #- name: Upload artifact
-      #  uses: actions/upload-artifact@v5
-      #  with:
-      #    name: ${{ env.BINARY_NAME }}-${{ matrix.suffix }}
-      #    path: slide-rs/target/release/${{ env.BINARY_NAME }}${{ matrix.ext }}
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.suffix }}
+          path: slide-rs/target/release/${{ env.BINARY_NAME }}${{ matrix.ext }}
 
   release:
     name: Create Release
