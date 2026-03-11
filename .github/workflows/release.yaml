@@ -22,10 +22,10 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/z00m128/sjasmplus.git  --recurse-submodules # --branch v1.21.1
           cd sjasmplus && make && sudo make install
-          
+
       - name: Install cpmtools
         run: sudo apt-get install -y cpmtools
-        
+
       #- name: Assemble Z80 binary
       #  run: sjasmplus slide.asm --raw=slide.com
 
@@ -114,19 +114,25 @@ jobs:
             --key-id "$APPLE_API_KEY_ID" \
             --issuer "$APPLE_API_ISSUER_ID" \
             --wait
-            
+
       # this DOES fail: the gateway doesn't play well with standalone binaries
       # if so the workaround for offline users is: xattr -d com.apple.quarantine ./slide
       #- name: Staple notarization ticket (macOS)
       #  if: matrix.os == 'macos-latest'
       #  run: |
       #    xcrun stapler staple slide-rs/target/release/${{ env.BINARY_NAME }}
-      
+
+      # linux and macos binaries both called "slide" which causes some bother...
+      - name: Rename binary for release
+        run: |
+          cp slide-rs/target/release/${{ env.BINARMY_NAME }}${{ matrix.ext }} \
+             ${{ env.BINARY_NAME }}-${{ matrix.suffix }}${{ matrix.ext }}
+
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: ${{ env.BINARY_NAME }}-${{ matrix.suffix }}
-          path: slide-rs/target/release/${{ env.BINARY_NAME }}${{ matrix.ext }}
+          path: ${{ env.BINARY_NAME }}-${{ matrix.suffix }}${{ matrix.ext }}
 
   release:
     name: Create Release
@@ -144,9 +150,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ${{ env.BINARY_NAME }}-linux-amd64/${{ env.BINARY_NAME }}
-            ${{ env.BINARY_NAME }}-windows-amd64/${{ env.BINARY_NAME }}.exe
-            ${{ env.BINARY_NAME }}-macos-amd64/${{ env.BINARY_NAME }}
+            ${{ env.BINARY_NAME }}-linux-amd64/${{ env.BINARY_NAME }}-linux-amd64
+            ${{ env.BINARY_NAME }}-windows-amd64/${{ env.BINARY_NAME }}-windows-amd64.exe
+            ${{ env.BINARY_NAME }}-macos-amd64/${{ env.BINARY_NAME }}-macos-amd64
             z80-binary/${{ env.BINARY_NAME }}.com
             cpm-disk-image/${{ env.BINARY_NAME }}_p25.img
-
