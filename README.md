@@ -177,8 +177,10 @@ YMMV, but I've tried:
 - sending filename with no extension
 - sending very long filenames on PC side
 - writing to A: (a bug in 1.7 makes this weirder than it ought to be)
+- linux, windows and macos builds of the rust tool 
+- very light testing on macos and windows 
+
 
 ## Things I've not tested
 
 - target file exists and is read-only (need to figure out the `stat` runes)
-- building slide-rs on MacOS or... Windows lol
