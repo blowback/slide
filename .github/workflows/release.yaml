@@ -30,7 +30,7 @@ jobs:
         run: sjasmplus slide.asm --raw=slide.com
 
       - name: Build disk image
-        run: make disk
+        run: make disk CPMTOOLS_DIR=/usr/bin
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
