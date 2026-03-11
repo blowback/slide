@@ -8,6 +8,7 @@ on:
 
 env:
   BINARY_NAME: slide # NB env not visible inside strategy.matrix!
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true # Yuck! upload-artifact@v5 should have sorted this....
 
 jobs:
   build:
