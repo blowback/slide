@@ -62,6 +62,11 @@ jobs:
         working-directory: slide-rs
         run: cargo build --release
 
+      - name: Sign binary (macOS)
+        if: matrix.os == 'macos-latest'
+        working-directory: slide-rs/target/release
+        run: codesign --sign - --force --preserve-metadata=entitlements,requirements,flags,runtime ${{ env.BINARY_NAME }}
+
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
