@@ -58,12 +58,15 @@ jobs:
           - os: ubuntu-latest
             suffix: linux-amd64
             ext: ""
+            binary: slide
           - os: windows-latest
             suffix: windows-amd64
             ext: .exe
+            binary: slide.exe
           - os: macos-latest
             suffix: macos-amd64
             ext: ""
+            binary: slide
 
     steps:
       - uses: actions/checkout@v5
@@ -125,7 +128,7 @@ jobs:
       # linux and macos binaries both called "slide" which causes some bother...
       - name: Rename binary for release
         run: |
-          cp slide-rs/target/release/${{ env.BINARMY_NAME }}${{ matrix.ext }} \
+          cp slide-rs/target/release/${{ matrix.binary }} \
              ${{ env.BINARY_NAME }}-${{ matrix.suffix }}${{ matrix.ext }}
 
       - name: Upload artifact
