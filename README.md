@@ -4,84 +4,128 @@ File transfer from PC to the [FeerSum Beasts MicroBeast Z80 Computer](https://fe
 
 Sliding window protocol with CRC-16 error detection and hardware flow control.
 
-95%+ link utilisation for files > 2K. CP/M binary is 1.3 KBytes.
+95%+ link utilisation for files > 2K. CP/M binary is 2.5 KBytes.
 
 Other Z80 based computers are available, and might work with a bit of fiddling about. IO ports and baud rates and such.
 
-## MicroBeast side
+![Transfer example](images/transfer.png)
 
-Build with sjasmplus:
+## Installation
+
+### On the MicroBeast
+
+Copy `slide.com` from [the latest release](https://github.com/blowback/slide/releases) to your MicroBeast, using whichever serial transfer software you are currently forced to tolerate.
+
+Alternatively you can use the monitor's Y-Modem transfer capability to copy over the disk image `slide_p25.img` using the "Address from file" option, then when it has transferred select the "CP/M disk" option.
+
+Once you've got on your MicroBeast, it's a good idea to copy it on to your RAM disk and use the MicroBeast's `save` utility to persist it.
+
+### On your PC
+
+Copy the relevant binary for your system (one of `slide-linux-amd64`, `slide-macos-amd64`, or `slide-windows-amd64.exe`) from the [latest release](https://github.com/blowback/slide/releases) to your PC. These are rust executables that handle both sending and receiving. If you prefer to use python, the original scripts are in `slide-py` - see [Python scripts](#python-scripts) for more info.
+
+#### A note for MacOS users
+
+Apple have made it impossible to "staple" single Mach-O binaries like `slide`: this means that the first time you run it, Gatekeeper on your system will do an online check, so you need internet access.
+
+If you want to run it offline, you can:
 
 ```
-make slide.com
+xattr -d com.apple.quarantine ./slide-macos-amd64
 ```
 
-Copy `slide.com` to a CP/M disk and run:
+which will disable GateKeeper checks entirely. 
+
+
+Don't worry, we are fully legit ;-) If you are nervous about this, you can verify the binary on a different, internet-connected mac:
 
 ```
-A> SLIDE
-```
-
-Or, you can `make disk` (you'll need cpmtools) and transfer  `slide_p25.img` to your system using whichever inferior serial transfer tools you are currently having to tolerate.
-
-SLIDE waits up to ~30 seconds for the PC to connect. `slide send /dev/ttyUSB0 TEST1K.dat` on the PC end will kick off a transfer.
-
-`SLIDE` is an alias for `SLIDE R` ("slide receive") - meaning that the MicroBeast will download and save any files sent from the PC side.
-
-You can also **send** files from the MicroBeast:
+codesign -dv --verbose=4 ./slide-macos-amd64
 
 ```
-A> SLIDE S TEST1K.DAT
+
+which will show you my team credentials, and:
+
+```
+codesign --verify --verbose ./slide-macos-amd64
 ```
 
-On the PC side the corresponding command is `slide recv /dev/ttyUSB0` to start receiving the files. They'll go in the current directory: you can specify the option `--output-dir SOMEDIR` to change that.
+should get you `valid on disk` and `satisfies its Designated Requirement`.
 
-## PC side
+You can then check the notarization status with:
 
-You've got a couple of options here, you can either use the all-singing, all-dancing unified Rust binary, or you can mess about with the original shonky Python scripts.
+```
+spctl --assess --verbose ./slide-macos-amd64
+```
 
-### Unified rust binary
+which should say `accepted` and `source: Notarized Developer ID`.
 
-To build the `slide` executable for your system, change into the `slide-rs` directory and type `cargo build --release`.  This will net you a binary in `target/release/slide` that you can copy to somewhere on your PATH (I stick it in `~/.local/bin`).
+If your happy with that, copy that exact same binary to your air-gapped mac. 
 
-Then to send a single file:
+## Transferring files
+
+### Sending files from PC to MicroBeast
+
+On the MicroBeast, run:
+
+```
+slide
+```
+
+`slide` is an alias for `slide r` - slide in receive mode. This will wait up to 30 seconds for the PC to establish a link.
+
+On the PC, run:
 
 ```
 slide send /dev/ttyUSB0 TEST1K.dat
 ```
 
-and type `slide` on the MicroBeast to get things going.
+To kick off a transfer.
 
-To send multiple files:
+You can send multiple files in one go:
 
 ```
-slide send /dev/ttyUSB0 TEST1K.DAT TEST{1,2,4,8,16,32,64}K.dat
+slide send /dev/ttyUSB0 TEST1K.dat TEST2K.dat TEST4K.dat
 ```
 
-and type `slide` on the MicroBeast to get things going.
+### Sending files from MicroBeast to PC 
 
-Look at the pretty:
+It works in reverse too: this time we use "send" mode on the MicroBeast:
 
-![Transfer example](images/transfer.png)
+```
+send S TEST1K.DAT 
+```
 
-If you want to **receive** files on the PC end:
+and on the PC side:
 
 ```
 slide recv /dev/ttyUSB0
-
 ```
 
-or 
+This will put received files in the current directory. You can change that:
 
 ```
-slide recv --output-dir SOMEDIR /dev/ttyUSB0
+slide recv --output-dir /tmp /dev/ttyUSB0
 ```
 
-and type `slide s FOO.DAT` on the 'beast.
 
-If you want to know all the options, `slide --help` has got you covered.
 
-### Shonky Python scripts
+
+
+## Build it yourself
+
+If you want to build it yourself, the top-level `Makefile` will build the z80 binary and a CP/M disk image. You'll need [sjasmplus](https://github.com/z00m128/sjasmplus) and [cpmtools](https://github.com/z00m128/sjasmplus).
+
+Python PC tools are in `slide-py`.
+
+Rust PC tools are in `slide-rs` - just `cargo build --release` in there.
+
+
+
+
+
+
+### Python scripts
 
 Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/):
 
@@ -113,7 +157,7 @@ If you change the baudrate, you'll have to change the baudrate divisor in `slide
 ## Hardware
 
 - Z80 at 8MHz with TL16C550 UART (1.8432MHz crystal, divisor 6 = 19200 baud)
-- USB serial cable on PC side
+- USB serial port on PC side
 - UART FIFOs enabled with auto RTS/CTS flow control
 
 ## Things I've tested
