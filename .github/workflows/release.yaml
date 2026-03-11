@@ -98,17 +98,17 @@ jobs:
             --issuer "$APPLE_API_ISSUER_ID" \
             --wait
             
-      # this might fail: the gateway doesn't play well with standalone binaries
+      # this DOES fail: the gateway doesn't play well with standalone binaries
       # if so the workaround for offline users is: xattr -d com.apple.quarantine ./slide
-      - name: Staple notarization ticket (macOS)
-        if: matrix.os == 'macos-latest'
-        run: |
-          xcrun stapler staple slide-rs/target/release/${{ env.BINARY_NAME }}
-      - name: Upload artifact
-        uses: actions/upload-artifact@v5
-        with:
-          name: ${{ env.BINARY_NAME }}-${{ matrix.suffix }}
-          path: slide-rs/target/release/${{ env.BINARY_NAME }}${{ matrix.ext }}
+      #- name: Staple notarization ticket (macOS)
+      #  if: matrix.os == 'macos-latest'
+      #  run: |
+      #    xcrun stapler staple slide-rs/target/release/${{ env.BINARY_NAME }}
+      #- name: Upload artifact
+      #  uses: actions/upload-artifact@v5
+      #  with:
+      #    name: ${{ env.BINARY_NAME }}-${{ matrix.suffix }}
+      #    path: slide-rs/target/release/${{ env.BINARY_NAME }}${{ matrix.ext }}
 
   release:
     name: Create Release
