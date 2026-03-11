@@ -26,11 +26,20 @@ jobs:
       - name: Assemble Z80 binary
         run: sjasmplus slide.asm --raw=slide.com
 
+      - name: Build disk image
+        run: make disk
+
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: z80-binary
           path: slide.com
+
+      - name: Upload CP/M disk image
+        uses: actions/upload-artifact@v5
+        with:
+          name: cpm-disk-image
+          path: slide_p25.img
 
   build:
     name: Build (${{ matrix.os }})
@@ -129,4 +138,6 @@ jobs:
             ${{ env.BINARY_NAME }}-linux-amd64/${{ env.BINARY_NAME }}
             ${{ env.BINARY_NAME }}-windows-amd64/${{ env.BINARY_NAME }}.exe
             ${{ env.BINARY_NAME }}-macos-amd64/${{ env.BINARY_NAME }}
-            z80-binary/slide.com
+            z80-binary/${{BINARY_NAME}}.com
+            cpm-disk-image/${{BINARY_NAME}}_p25.img
+
