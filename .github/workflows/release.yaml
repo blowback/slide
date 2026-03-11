@@ -33,6 +33,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build
+        working-directory: slide-rs
         run: cargo build --release
 
       - name: Upload artifact
