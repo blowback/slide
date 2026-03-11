@@ -1,5 +1,5 @@
 ; ============================================================================
-; SLIDE v0.2 - Serial Line Inter-Device (file) Exchange
+; SLIDE v0.4 - Serial Line Inter-Device (file) Exchange
 ; Custom file transfer protocol for Z80 / CP/M
 ; Target: 8MHz Z80, TL16C550 UART with 16-byte FIFO, auto RTS/CTS flow control
 ;
@@ -1765,8 +1765,8 @@ print_hex_a
 ; ============================================================================
 ; Messages
 ; ============================================================================
-msg_banner_recv DB	"SLIDE v0.2 - Receive mode", 13, 10, '$'
-msg_banner_send DB	"SLIDE v0.2 - Send mode", 13, 10, '$'
+msg_banner_recv DB	"SLIDE v0.4 - Receive mode", 13, 10, '$'
+msg_banner_send DB	"SLIDE v0.4 - Send mode", 13, 10, '$'
 msg_sending     DB	"Sending: ", '$'
 msg_done        DB	13, 10, "Transfer complete!", 13, 10, '$'
 msg_done_session DB	13, 10, "Session complete.", 13, 10, '$'
