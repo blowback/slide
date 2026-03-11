@@ -1,9 +1,13 @@
 # Makefile for SLIDE
+
+# Local paths for dev tools
 BEAST_DIR = $(HOME)/src/microbeast
 SJASMPLUS_DIR = $(BEAST_DIR)/sjasmplus
-CPMTOOLS_DIR = $(BEAST_DIR)/cpmtools-2.23
+CPMTOOLS_DIR ?= $(BEAST_DIR)/cpmtools-2.23
 
-SJASMPLUS = ${SJASMPLUS_DIR}/sjasmplus
+# find globally installed tools (ci/cd) or fall back to local installations (dev)
+#SJASMPLUS = ${SJASMPLUS_DIR}/sjasmplus
+SJASMPLUS ?= $(shell command -v sjasmplus || echo $(SJASMPLUS_DIR)/sjasmplus)
 
 # CP/M stuff
 CPM_DISK_TYPE = -f memotech-type50
