@@ -44,6 +44,11 @@ pub fn send_session(port_name: &str, files: &[String], baud: u32, debug: bool) -
         thread::sleep(Duration::from_secs(1));
         match recv_control(port.as_mut(), Duration::from_secs(1)) {
             Ok(Control::Rdy) => break,
+            Ok(Control::Can) => {
+                // v0.2.1 §2: recv_control already echoed CAN and drained.
+                spin.abandon_with_message(style("Cancelled by Z80").yellow().to_string());
+                return Ok(());
+            }
             _ => continue,
         }
     }

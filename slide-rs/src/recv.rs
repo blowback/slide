@@ -41,6 +41,11 @@ pub fn recv_session(port_name: &str, baud: u32, output_dir: &str, debug: bool) -
         }
         match recv_control(port.as_mut(), remaining.min(Duration::from_secs(2))) {
             Ok(Control::Rdy) => break,
+            Ok(Control::Can) => {
+                // v0.2.1 §2: recv_control already echoed CAN and drained.
+                spin.abandon_with_message(style("Cancelled by Z80").yellow().to_string());
+                return Ok(());
+            }
             _ => continue,
         }
     }
@@ -74,6 +79,10 @@ pub fn recv_session(port_name: &str, baud: u32, output_dir: &str, debug: bool) -
                 }
                 break;
             }
+            RecvResult::Cancelled => {
+                println!("  Cancelled by Z80.");
+                break;
+            }
             RecvResult::Error => {
                 println!("  File transfer failed, aborting session.");
                 break;
@@ -97,6 +106,7 @@ pub fn recv_session(port_name: &str, baud: u32, output_dir: &str, debug: bool) -
 enum RecvResult {
     Ok(u64),
     Fin,
+    Cancelled,
     Error,
 }
 
@@ -104,6 +114,7 @@ fn recv_one_file(port: &mut dyn serialport::SerialPort, output_dir: &str, debug:
     // Receive header frame (seq 0)
     let (filename, filesize) = match recv_frame(port, Duration::from_secs(30))? {
         FrameResult::Fin => return Ok(RecvResult::Fin),
+        FrameResult::Cancel => return Ok(RecvResult::Cancelled),
         FrameResult::Data(frame) => {
             if debug {
                 eprintln!(
@@ -166,6 +177,10 @@ fn recv_one_file(port: &mut dyn serialport::SerialPort, output_dir: &str, debug:
             Ok(FrameResult::Fin) => {
                 pb.abandon_with_message(style("unexpected FIN").red().to_string());
                 return Ok(RecvResult::Error);
+            }
+            Ok(FrameResult::Cancel) => {
+                pb.abandon_with_message(style("cancelled by Z80").yellow().to_string());
+                return Ok(RecvResult::Cancelled);
             }
             Ok(FrameResult::Data(frame)) => {
                 retry_count = 0;

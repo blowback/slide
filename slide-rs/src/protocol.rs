@@ -1,4 +1,5 @@
 use anyhow::{bail, Result};
+use std::thread;
 use std::time::{Duration, Instant};
 
 // Protocol constants
@@ -11,6 +12,22 @@ pub const CTRL_CAN: u8 = 0x18;
 
 pub const WIN_SIZE: usize = 4;
 pub const FRAME_SIZE: usize = 1024;
+
+/// v0.2.1 §1: Z80 emits this 7-byte signature on entering SLIDE mode,
+/// before any RDY/control/payload. PCs may use it as a liveness signal;
+/// they MUST tolerate it appearing on the wire as non-SOF / non-control bytes.
+#[allow(dead_code)]
+pub const WAKEUP_SIG: [u8; 7] = [0x1B, 0x5E, b'S', b'L', b'I', b'D', b'E'];
+
+/// v0.2.1 §2: echo CTRL_CAN back to the peer within ~500 ms, then drain
+/// the wire so the next session starts clean.
+pub fn echo_can_and_drain(port: &mut dyn serialport::SerialPort) -> Result<()> {
+    port.write_all(&[CTRL_CAN])?;
+    port.flush()?;
+    thread::sleep(Duration::from_millis(50));
+    port.clear(serialport::ClearBuffer::Input)?;
+    Ok(())
+}
 
 /// CRC-16-CCITT (polynomial 0x1021, init 0xFFFF).
 pub fn crc16_ccitt(data: &[u8]) -> u16 {
@@ -79,6 +96,10 @@ fn read_byte_timeout(port: &mut dyn serialport::SerialPort, timeout: Duration) -
 }
 
 /// Wait for a control byte (ACK/NAK/RDY/CAN/FIN) from the remote side.
+///
+/// v0.2.1 §2: on CTRL_CAN this auto-echoes CAN back and drains the wire
+/// before returning Control::Can — caller can simply treat it as a
+/// confirmed cancel and abort to idle.
 pub fn recv_control(port: &mut dyn serialport::SerialPort, timeout: Duration) -> Result<Control> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -101,9 +122,12 @@ pub fn recv_control(port: &mut dyn serialport::SerialPort, timeout: Duration) ->
                 return Ok(if b == CTRL_ACK { Control::Ack(seq) } else { Control::Nak(seq) });
             }
             CTRL_RDY => return Ok(Control::Rdy),
-            CTRL_CAN => return Ok(Control::Can),
+            CTRL_CAN => {
+                echo_can_and_drain(port)?;
+                return Ok(Control::Can);
+            }
             CTRL_FIN => return Ok(Control::Fin),
-            _ => continue, // ignore spurious bytes
+            _ => continue, // ignore spurious bytes (incl. wakeup signature)
         }
     }
 }
@@ -114,17 +138,19 @@ pub struct Frame {
     pub payload: Vec<u8>,
 }
 
-/// Result of recv_frame: either a data frame or FIN.
+/// Result of recv_frame: a data frame, FIN, or peer-initiated cancel
+/// (CAN already echoed and wire drained per v0.2.1 §2).
 pub enum FrameResult {
     Data(Frame),
     Fin,
+    Cancel,
 }
 
 /// Receive a SLIDE frame from the serial port.
 pub fn recv_frame(port: &mut dyn serialport::SerialPort, timeout: Duration) -> Result<FrameResult> {
     let deadline = Instant::now() + timeout;
 
-    // Wait for SOF or FIN
+    // Wait for SOF, FIN, or CAN. Other bytes (e.g. wakeup signature) are skipped.
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -138,6 +164,10 @@ pub fn recv_frame(port: &mut dyn serialport::SerialPort, timeout: Duration) -> R
         }
         if b == CTRL_FIN {
             return Ok(FrameResult::Fin);
+        }
+        if b == CTRL_CAN {
+            echo_can_and_drain(port)?;
+            return Ok(FrameResult::Cancel);
         }
     }
 
