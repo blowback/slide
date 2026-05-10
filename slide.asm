@@ -1,12 +1,20 @@
 ; ============================================================================
-; SLIDE v0.4 - Serial Line Inter-Device (file) Exchange
-; Custom file transfer protocol for Z80 / CP/M
+; SLIDE v0.5 - Serial Line Inter-Device (file) Exchange
+; Custom file transfer protocol for Z80 / CP/M (wire protocol v0.2.1)
 ; Target: 8MHz Z80, TL16C550 UART with 16-byte FIFO, auto RTS/CTS flow control
 ;
 ; Usage:  SLIDE              — receive mode (default)
 ;         SLIDE R            — receive mode (explicit)
 ;         SLIDE S FILE.COM   — send FILE.COM to PC
 ;         SLIDE S A.COM B.DAT — send multiple files
+;
+; v0.2.1 amendments (vs v0.2):
+;   §1 Wakeup signature: emit ESC ^ S L I D E on entering SLIDE mode,
+;      before any RDY/control/payload. Lets the host (e.g. Beastty)
+;      detect that SLIDE.COM is alive without polling.
+;   §2 Bidirectional CTRL_CAN: either side may initiate cancel; the
+;      other side echoes CTRL_CAN back within ~500 ms. Idempotent —
+;      a second CAN from the same side is a no-op.
 ; ============================================================================
 ;
                 OUTPUT	slide.com
@@ -380,17 +388,58 @@ send_rdy
                 CALL	uart_tx
                 RET
 
-; Send CAN (cancel)
+; Send CAN (cancel) — Z80-initiated. Per v0.2.1 §2:
+; sets can_initiated so any incoming CAN is recognised as the peer's
+; echo (and not re-echoed); waits briefly for that echo, then drains
+; the wire so the next session starts clean.
 send_can
+                LD	A, 1
+                LD	(can_initiated), A
                 LD	A, CTRL_CAN
                 CALL	uart_tx
+                ; wait briefly for peer's echo, then drain
+                CALL	uart_rx_timeout
+                CALL	uart_flush_rx
                 RET
+
+; respond_to_cancel — peer sent CTRL_CAN. Echo back unless we initiated.
+; Marks the cancel state so subsequent CAN bytes from either side are no-ops
+; (idempotency, v0.2.1 §2.4). Caller should clean up and return to idle.
+; Trashes A.
+respond_to_cancel
+                LD	A, (can_initiated)
+                OR	A
+                JR	NZ, .skip_echo
+                LD	A, CTRL_CAN
+                CALL	uart_tx
+.skip_echo
+                LD	A, 1
+                LD	(can_initiated), A
+                CALL	uart_flush_rx
+                RET
+
+can_initiated   DB	0
 
 ; Send FIN
 send_fin
                 LD	A, CTRL_FIN
                 CALL	uart_tx
                 RET
+
+; Send wakeup signature ESC ^ S L I D E (v0.2.1 §1).
+; Caller: emit at start of recv_session/send_session, before any RDY
+; or framed payload. Lets the PC detect SLIDE.COM is alive.
+send_wakeup
+                LD	HL, wakeup_sig
+                LD	B, 7
+.loop
+                LD	A, (HL)
+                CALL	uart_tx
+                INC	HL
+                DJNZ	.loop
+                RET
+
+wakeup_sig      DB	0x1B, 0x5E, 'S', 'L', 'I', 'D', 'E'
 
 ; ============================================================================
 ; recv_control_z80 — wait for PC's ACK/NAK/FIN
@@ -411,9 +460,17 @@ recv_control_z80
                 CP	CTRL_FIN
                 JR	Z, .no_seq
                 CP	CTRL_CAN
-                JR	Z, .no_seq
+                JR	Z, .got_can
                 ; stray byte (RDY etc) — keep waiting
                 JR	.wait
+
+.got_can
+                ; v0.2.1 §2: echo CAN back if peer initiated, then return
+                ; CTRL_CAN to caller so it can abort cleanly.
+                CALL	respond_to_cancel
+                LD	A, CTRL_CAN
+                OR	A               ; clear carry
+                RET
 
 .with_seq
                 LD	E, A            ; save control byte (E preserved by uart_rx_timeout)
@@ -446,7 +503,9 @@ recv_control_z80
 ;           D = first byte received (SOF, CTRL_FIN, etc.) if fail_sof
 ; ============================================================================
 recv_frame
-                ; wait for SOF (or FIN)
+                ; clear signal byte; .got_fin / .got_can set it before signalling carry
+                LD	D, 0
+                ; wait for SOF (or FIN/CAN)
 .wait_sof
                 CALL	uart_rx_timeout
                 JP	C, .fail_sof
@@ -454,11 +513,19 @@ recv_frame
                 JR	Z, .after_sof
                 CP	CTRL_FIN
                 JR	Z, .got_fin
+                CP	CTRL_CAN
+                JR	Z, .got_can
                 JR	.wait_sof
 
 .got_fin
                 ; signal FIN to caller via D=CTRL_FIN, carry set
                 LD	D, CTRL_FIN
+                SCF
+                RET
+
+.got_can
+                ; signal CAN to caller via D=CTRL_CAN, carry set (v0.2.1 §2)
+                LD	D, CTRL_CAN
                 SCF
                 RET
 
@@ -769,6 +836,12 @@ close_file
 ; FIN received instead of SOF → send FIN, exit.
 ; ============================================================================
 recv_session
+                ; reset cancel state for fresh session, then emit wakeup
+                ; signature so the host knows SLIDE.COM is alive (v0.2.1 §1)
+                XOR	A
+                LD	(can_initiated), A
+                CALL	send_wakeup
+
                 ; --- Handshake: wait for PC's RDY, echo back ---
                 LD	E, 15           ; ~30s (15 × ~2s timeout)
 .wait_pc
@@ -776,6 +849,8 @@ recv_session
                 JR	C, .wait_retry
                 CP	CTRL_RDY
                 JR	Z, .pc_ready
+                CP	CTRL_CAN
+                JR	Z, .got_can_hs
                 ; not RDY — ignore and keep waiting
                 JR	.wait_pc
 
@@ -784,6 +859,13 @@ recv_session
                 JR	NZ, .wait_pc
                 ; gave up
                 LD	DE, msg_err_hdr
+                LD	C, C_WRITESTR
+                CALL	BDOS
+                RET
+
+.got_can_hs
+                CALL	respond_to_cancel
+                LD	DE, msg_cancelled
                 LD	C, C_WRITESTR
                 CALL	BDOS
                 RET
@@ -801,6 +883,8 @@ recv_session
                 JR	C, .file_loop   ; timeout — keep waiting
                 CP	CTRL_FIN
                 JR	Z, .got_fin
+                CP	CTRL_CAN
+                JR	Z, .got_can_session
                 CP	SOF
                 JR	NZ, .file_loop  ; ignore stray bytes
 
@@ -851,6 +935,13 @@ recv_session
                 CALL	BDOS
                 RET
 
+.got_can_session
+                CALL	respond_to_cancel
+                LD	DE, msg_cancelled
+                LD	C, C_WRITESTR
+                CALL	BDOS
+                RET
+
 .file_error
                 ; recv_file already printed error and sent CAN — just exit
                 RET
@@ -896,7 +987,7 @@ recv_file
                 ; check for EOF (zero-length frame)
                 LD	A, B
                 OR	C
-                JR	Z, .end_of_file
+                JP	Z, .end_of_file
 
                 ; verify sequence number
                 LD	A, (expected_seq)
@@ -945,6 +1036,12 @@ recv_file
                 JR	.recv_loop
 
 .handle_error
+                ; v0.2.1 §2: recv_frame signals peer-initiated cancel via D=CTRL_CAN.
+                ; CAN was already echoed by recv_frame's caller path — just clean up.
+                LD	A, D
+                CP	CTRL_CAN
+                JP	Z, .got_can_recv
+
                 LD	A, (retry_count)
                 INC	A
                 LD	(retry_count), A
@@ -955,10 +1052,18 @@ recv_file
                 CALL	send_nak
                 JR	.recv_loop
 
+.got_can_recv
+                CALL	respond_to_cancel
+                LD	DE, msg_cancelled
+                LD	C, C_WRITESTR
+                CALL	BDOS
+                SCF                  ; signal error to caller
+                RET
+
 .seq_error
                 LD	A, (expected_seq)
                 CALL	send_nak
-                JR	.recv_loop
+                JP	.recv_loop
 
 .abort
                 LD	DE, msg_err_abort
@@ -1063,6 +1168,11 @@ flush_to_disk
 ; Then: for each file: open → send_file_tx → close. After all files: FIN exchange.
 ; ============================================================================
 send_session
+                ; reset cancel state and emit wakeup signature (v0.2.1 §1)
+                XOR	A
+                LD	(can_initiated), A
+                CALL	send_wakeup
+
                 ; --- Handshake: sender sends RDY, waits for PC's RDY echo ---
                 LD	E, 15           ; ~30s
 .wait_pc
@@ -1071,6 +1181,8 @@ send_session
                 JR	C, .wait_retry
                 CP	CTRL_RDY
                 JR	Z, .pc_ready
+                CP	CTRL_CAN
+                JR	Z, .got_can_hs
                 ; not RDY — keep trying
                 JR	.wait_pc
 
@@ -1079,6 +1191,13 @@ send_session
                 JR	NZ, .wait_pc
                 ; gave up
                 LD	DE, msg_err_nopc
+                LD	C, C_WRITESTR
+                CALL	BDOS
+                RET
+
+.got_can_hs
+                CALL	respond_to_cancel
+                LD	DE, msg_cancelled
                 LD	C, C_WRITESTR
                 CALL	BDOS
                 RET
@@ -1122,7 +1241,20 @@ send_session
                 ; close file
                 CALL	close_file
 
+                ; v0.2.1 §2: if cancel happened during this file, abort the
+                ; whole session — don't try to send subsequent files into a
+                ; peer that has returned to idle.
+                LD	A, (can_initiated)
+                OR	A
+                JR	NZ, .session_cancelled
+
                 JR	.next_file      ; loop for next file
+
+.session_cancelled
+                LD	DE, msg_cancelled
+                LD	C, C_WRITESTR
+                CALL	BDOS
+                RET
 
 .all_sent
                 ; --- Send FIN, wait for echo ---
@@ -1765,8 +1897,8 @@ print_hex_a
 ; ============================================================================
 ; Messages
 ; ============================================================================
-msg_banner_recv DB	"SLIDE v0.4 - Receive mode", 13, 10, '$'
-msg_banner_send DB	"SLIDE v0.4 - Send mode", 13, 10, '$'
+msg_banner_recv DB	"SLIDE v0.5 - Receive mode", 13, 10, '$'
+msg_banner_send DB	"SLIDE v0.5 - Send mode", 13, 10, '$'
 msg_sending     DB	"Sending: ", '$'
 msg_done        DB	13, 10, "Transfer complete!", 13, 10, '$'
 msg_done_session DB	13, 10, "Session complete.", 13, 10, '$'
@@ -1780,4 +1912,5 @@ msg_dbg_fail    DB	13, 10, "DBG: recv_frame failed", 13, 10, '$'
 msg_dbg_crc     DB	"DBG: CRC mismatch cmp/prs: ", '$'
 msg_dbg_tmo     DB	"DBG: timeout in payload", 13, 10, '$'
 msg_err_abort   DB	13, 10, "Transfer aborted - connection lost", 13, 10, '$'
+msg_cancelled   DB	13, 10, "Transfer cancelled by peer", 13, 10, '$'
                 END	entry

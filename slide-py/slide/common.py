@@ -5,6 +5,7 @@ Shared protocol constants, CRC, frame building, and serial helpers.
 
 import serial
 import struct
+import time
 from pathlib import Path
 
 # Protocol constants
@@ -17,6 +18,26 @@ CTRL_CAN  = 0x18
 
 WIN_SIZE   = 4
 FRAME_SIZE = 1024
+
+# v0.2.1 §1: Z80 emits this 7-byte signature on entering SLIDE mode,
+# before any RDY/control/payload. PCs may use it as a liveness signal;
+# they MUST tolerate it appearing on the wire as non-SOF / non-control bytes.
+WAKEUP_SIG = bytes([0x1B, 0x5E, 0x53, 0x4C, 0x49, 0x44, 0x45])  # ESC ^ S L I D E
+
+
+class CanReceived(Exception):
+    """v0.2.1 §2: peer sent CTRL_CAN. The receiving helper has already
+    echoed CAN back and drained the wire — caller should abort to idle."""
+    pass
+
+
+def _echo_can_and_drain(ser: serial.Serial):
+    """v0.2.1 §2: echo CTRL_CAN back to the peer within ~500 ms, then drain
+    so the wire is clean before either side starts the next session."""
+    ser.write(bytes([CTRL_CAN]))
+    ser.flush()
+    time.sleep(0.05)
+    ser.reset_input_buffer()
 
 
 def crc16_ccitt(data: bytes, crc: int = 0xFFFF) -> int:
@@ -54,6 +75,10 @@ def recv_control(ser: serial.Serial, timeout: float = 10.0) -> tuple:
     Wait for a control byte from the remote side.
     Returns: (control_type, seq_or_none)
     Recognises ACK, NAK (with seq byte), RDY, CAN, FIN (no seq).
+
+    v0.2.1: on CTRL_CAN, echoes CAN back and drains the wire before
+    returning, so the caller can simply treat (CTRL_CAN, None) as a
+    confirmed cancel and abort to idle.
     """
     ser.timeout = timeout
     while True:
@@ -67,9 +92,12 @@ def recv_control(ser: serial.Serial, timeout: float = 10.0) -> tuple:
             if not seq_byte:
                 raise TimeoutError("Timeout waiting for sequence byte")
             return (ctrl, seq_byte[0])
-        elif ctrl in (CTRL_RDY, CTRL_CAN, CTRL_FIN):
+        elif ctrl == CTRL_CAN:
+            _echo_can_and_drain(ser)
+            return (CTRL_CAN, None)
+        elif ctrl in (CTRL_RDY, CTRL_FIN):
             return (ctrl, None)
-        # else: ignore spurious bytes
+        # else: ignore spurious bytes (incl. wakeup signature bytes)
 
 
 def open_serial(port: str, baud: int = 19200) -> serial.Serial:

@@ -20,6 +20,7 @@ from slide.common import (
     SOF, CTRL_ACK, CTRL_NAK, CTRL_RDY, CTRL_FIN, CTRL_CAN,
     WIN_SIZE, FRAME_SIZE,
     crc16_ccitt, build_frame, build_header_frame, recv_control, open_serial,
+    _echo_can_and_drain,
 )
 
 
@@ -177,17 +178,25 @@ def send_session(port: str, files: list, baud: int = 19200, debug: bool = False)
     ser = open_serial(port, baud)
 
     # --- Handshake: sender sends RDY first, waits for receiver's RDY echo ---
+    # Wakeup signature bytes (v0.2.1 §1) and other stray bytes are skipped.
     print("Waiting for Z80 (start SLIDE R on Z80 now)...")
     ser.timeout = 60
     while True:
         ser.write(bytes([CTRL_RDY]))
         ser.flush()
         time.sleep(1.0)
-        # Check if Z80 echoed RDY back
+        # Check for an interesting reply
         ser.timeout = 1.0
         b = ser.read(1)
-        if b and b[0] == CTRL_RDY:
+        if not b:
+            continue
+        if b[0] == CTRL_RDY:
             break
+        if b[0] == CTRL_CAN:
+            _echo_can_and_drain(ser)
+            print("Cancelled by Z80 before handshake.")
+            ser.close()
+            return
     print("Z80 ready.")
     time.sleep(0.05)
     ser.reset_input_buffer()

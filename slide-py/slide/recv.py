@@ -16,7 +16,7 @@ from pathlib import Path
 from slide.common import (
     SOF, CTRL_ACK, CTRL_NAK, CTRL_RDY, CTRL_FIN, CTRL_CAN,
     WIN_SIZE, FRAME_SIZE,
-    crc16_ccitt, open_serial,
+    crc16_ccitt, open_serial, _echo_can_and_drain, CanReceived,
 )
 
 
@@ -24,7 +24,9 @@ def recv_frame(ser, timeout: float = 10.0):
     """
     Receive a SLIDE frame from the serial port.
     Returns: (seq, payload) on success
-    Raises: TimeoutError, ValueError (CRC mismatch)
+    Raises: TimeoutError, ValueError (CRC mismatch),
+            _FinReceived (FIN at SOF wait), CanReceived (CAN at SOF wait —
+            already echoed and drained per v0.2.1 §2)
     """
     ser.timeout = timeout
 
@@ -37,6 +39,10 @@ def recv_frame(ser, timeout: float = 10.0):
             break
         if b[0] == CTRL_FIN:
             raise _FinReceived()
+        if b[0] == CTRL_CAN:
+            _echo_can_and_drain(ser)
+            raise CanReceived()
+        # else: stray byte (e.g. wakeup signature) — keep waiting
 
     return _recv_frame_after_sof(ser)
 
@@ -100,6 +106,9 @@ def recv_one_file(ser, output_dir: str, debug: bool = False) -> bool:
         seq, payload = recv_frame(ser, timeout=30.0)
     except _FinReceived:
         return None  # session done
+    except CanReceived:
+        print("  Cancelled by Z80.")
+        return False
     except (TimeoutError, ValueError) as e:
         print(f"  Error receiving header: {e}")
         return False
@@ -129,6 +138,9 @@ def recv_one_file(ser, output_dir: str, debug: bool = False) -> bool:
             seq, payload = recv_frame(ser, timeout=10.0)
         except _FinReceived:
             print("  Unexpected FIN during file transfer")
+            return False
+        except CanReceived:
+            print("\n  Cancelled by Z80.")
             return False
         except TimeoutError as e:
             retry_count += 1
@@ -205,6 +217,7 @@ def recv_session(port: str, baud: int = 19200, output_dir: str = '.', debug: boo
     ser = open_serial(port, baud)
 
     # --- Handshake: wait for sender's RDY, echo RDY back ---
+    # Wakeup signature bytes (v0.2.1 §1) and other stray bytes are skipped.
     print("Waiting for Z80 sender (start SLIDE S <file> on Z80 now)...")
     ser.timeout = 60
     while True:
@@ -215,6 +228,11 @@ def recv_session(port: str, baud: int = 19200, output_dir: str = '.', debug: boo
             return
         if b[0] == CTRL_RDY:
             break
+        if b[0] == CTRL_CAN:
+            _echo_can_and_drain(ser)
+            print("Cancelled by Z80 before handshake.")
+            ser.close()
+            return
 
     # Echo RDY back
     ser.write(bytes([CTRL_RDY]))
