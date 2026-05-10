@@ -857,8 +857,8 @@ recv_session
 .wait_retry
                 DEC	E
                 JR	NZ, .wait_pc
-                ; gave up
-                LD	DE, msg_err_hdr
+                ; gave up — PC never sent RDY during the handshake window
+                LD	DE, msg_err_handshake
                 LD	C, C_WRITESTR
                 CALL	BDOS
                 RET
@@ -1903,6 +1903,7 @@ msg_sending     DB	"Sending: ", '$'
 msg_done        DB	13, 10, "Transfer complete!", 13, 10, '$'
 msg_done_session DB	13, 10, "Session complete.", 13, 10, '$'
 msg_err_hdr     DB	13, 10, "Error: bad header frame", 13, 10, '$'
+msg_err_handshake DB	13, 10, "Error: PC did not send RDY (handshake timeout)", 13, 10, '$'
 msg_err_file    DB	13, 10, "Error: can't create file", 13, 10, '$'
 msg_err_disk    DB	13, 10, "Error: disk write failed", 13, 10, '$'
 msg_err_open    DB	13, 10, "Error: can't open file", 13, 10, '$'
