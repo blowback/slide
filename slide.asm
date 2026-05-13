@@ -1,5 +1,5 @@
 ; ============================================================================
-; SLIDE v0.5 - Serial Line Inter-Device (file) Exchange
+; SLIDE v0.5.1 - Serial Line Inter-Device (file) Exchange
 ; Custom file transfer protocol for Z80 / CP/M (wire protocol v0.2.1)
 ; Target: 8MHz Z80, TL16C550 UART with 16-byte FIFO, auto RTS/CTS flow control
 ;
@@ -103,16 +103,14 @@ entry
 
                 ; --- receive mode ---
                 LD	DE, msg_banner_recv
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 CALL	recv_session
                 JR	.out
 
 .do_send
                 ; --- send mode ---
                 LD	DE, msg_banner_send
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 CALL	send_session
                 JR	.out
 
@@ -859,15 +857,13 @@ recv_session
                 JR	NZ, .wait_pc
                 ; gave up — PC never sent RDY during the handshake window
                 LD	DE, msg_err_handshake
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 RET
 
 .got_can_hs
                 CALL	respond_to_cancel
                 LD	DE, msg_cancelled
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 RET
 
 .pc_ready
@@ -927,19 +923,24 @@ recv_session
                 JR	.file_loop
 
 .got_fin
+                ; Print the session-complete message BEFORE echoing FIN.
+                ; PC closes the serial port the instant it sees our FIN echo
+                ; (slide-py's `ser.close()` immediately after the FIN exchange),
+                ; which drops RTS → CTS goes low at our UART → AFE blocks
+                ; transmission → BIOS console output (no timeout) would hang
+                ; forever on LSR_THRE. PC's recv_control already skips
+                ; non-control bytes, so the text is harmless on the wire.
+                LD	DE, msg_done_session
+                CALL	print_user_msg
+
                 ; echo FIN back
                 CALL	send_fin
-
-                LD	DE, msg_done_session
-                LD	C, C_WRITESTR
-                CALL	BDOS
                 RET
 
 .got_can_session
                 CALL	respond_to_cancel
                 LD	DE, msg_cancelled
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 RET
 
 .file_error
@@ -948,15 +949,13 @@ recv_session
 
 .err_header
                 LD	DE, msg_err_hdr
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 CALL	send_can
                 RET
 
 .err_file
                 LD	DE, msg_err_file
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 CALL	send_can
                 RET
 
@@ -1055,8 +1054,7 @@ recv_file
 .got_can_recv
                 CALL	respond_to_cancel
                 LD	DE, msg_cancelled
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 SCF                  ; signal error to caller
                 RET
 
@@ -1067,8 +1065,7 @@ recv_file
 
 .abort
                 LD	DE, msg_err_abort
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 SCF                  ; signal error to caller
                 RET
 
@@ -1090,8 +1087,7 @@ recv_file
                 CALL	send_ack
 
                 LD	DE, msg_done
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 OR	A                ; clear carry = success
                 RET
 
@@ -1157,8 +1153,7 @@ flush_to_disk
 
 .write_err
                 LD	DE, msg_err_disk
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 SCF
                 RET
 
@@ -1191,15 +1186,13 @@ send_session
                 JR	NZ, .wait_pc
                 ; gave up
                 LD	DE, msg_err_nopc
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 RET
 
 .got_can_hs
                 CALL	respond_to_cancel
                 LD	DE, msg_cancelled
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 RET
 
 .pc_ready
@@ -1221,8 +1214,7 @@ send_session
 
                 ; print filename
                 LD	DE, msg_sending
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 CALL	print_fcb_name
 
                 ; open file
@@ -1252,26 +1244,27 @@ send_session
 
 .session_cancelled
                 LD	DE, msg_cancelled
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 RET
 
 .all_sent
+                ; Print BEFORE the FIN exchange — see the comment in
+                ; recv_session .got_fin. Once PC sees our FIN, it sends an
+                ; echo and closes the port, dropping RTS and stalling any
+                ; subsequent BIOS console output via AFE/CTS.
+                LD	DE, msg_done_session
+                CALL	print_user_msg
+
                 ; --- Send FIN, wait for echo ---
                 CALL	send_fin
                 ; wait for FIN echo (brief timeout)
                 CALL	recv_control_z80
                 ; don't care about result — we're done
-
-                LD	DE, msg_done_session
-                LD	C, C_WRITESTR
-                CALL	BDOS
                 RET
 
 .err_open
                 LD	DE, msg_err_open
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 ; continue with remaining files
                 JR	.next_file
 
@@ -1447,14 +1440,12 @@ send_file_tx
 
 .tx_abort
                 LD	DE, msg_err_abort
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 RET
 
 .tx_done
                 LD	DE, msg_done
-                LD	C, C_WRITESTR
-                CALL	BDOS
+                CALL	print_user_msg
                 RET
 
 tx_seq          DB	0
@@ -1737,24 +1728,23 @@ build_header_payload
                 RET
 
 ; ============================================================================
-; Print FCB filename (for status messages)
+; Print FCB filename (for status messages). Assembles "NAME.EXT\r\n$" into
+; fname_buf and routes through print_user_msg so it follows the same
+; wire-safe path (uart_tx for TTY users, BIOS for local-CRT users).
 ; ============================================================================
 print_fcb_name
-                ; print name (8 chars, skip trailing spaces)
+                LD	DE, fname_buf
+
+                ; copy name (up to 8 chars, stop at first trailing space)
                 LD	HL, FCB + 1
                 LD	B, 8
 .pn_name
                 LD	A, (HL)
                 CP	' '
                 JR	Z, .pn_dot
-                LD	E, A
-                PUSH	HL
-                PUSH	BC
-                LD	C, C_WRITE
-                CALL	BDOS
-                POP	BC
-                POP	HL
+                LD	(DE), A
                 INC	HL
+                INC	DE
                 DJNZ	.pn_name
 
 .pn_dot
@@ -1764,38 +1754,38 @@ print_fcb_name
                 CP	' '
                 JR	Z, .pn_done
 
-                ; print '.'
-                LD	E, '.'
-                PUSH	HL
-                LD	C, C_WRITE
-                CALL	BDOS
-                POP	HL
+                ; emit '.'
+                LD	A, '.'
+                LD	(DE), A
+                INC	DE
 
-                ; print extension
+                ; copy extension (up to 3 chars, stop at first trailing space)
                 LD	B, 3
 .pn_ext
                 LD	A, (HL)
                 CP	' '
                 JR	Z, .pn_done
-                LD	E, A
-                PUSH	HL
-                PUSH	BC
-                LD	C, C_WRITE
-                CALL	BDOS
-                POP	BC
-                POP	HL
+                LD	(DE), A
                 INC	HL
+                INC	DE
                 DJNZ	.pn_ext
 
 .pn_done
-                ; CRLF
-                LD	E, 13
-                LD	C, C_WRITE
-                CALL	BDOS
-                LD	E, 10
-                LD	C, C_WRITE
-                CALL	BDOS
+                ; append CRLF + '$' terminator
+                LD	A, 13
+                LD	(DE), A
+                INC	DE
+                LD	A, 10
+                LD	(DE), A
+                INC	DE
+                LD	A, '$'
+                LD	(DE), A
+
+                LD	DE, fname_buf
+                CALL	print_user_msg
                 RET
+
+fname_buf       DS	16
 
 ; ============================================================================
 ; CRC-16-CCITT routines
@@ -1895,10 +1885,60 @@ print_hex_a
                 RET
 
 ; ============================================================================
+; print_user_msg - emit a $-terminated string to the user's console.
+; DE = pointer to $-terminated string.
+;
+; For PC-driven users (original console = TTY, i.e. the serial UART), the
+; message is sent directly via uart_tx. We must NOT route via BDOS/BIOS in
+; this case: the MicroBeast BIOS's console-out path leaves the UART in a
+; state that breaks subsequent flow control on this machine. Symptom: after
+; the first BIOS-routed user message, Z80's RTS is deasserted (or AFE state
+; is otherwise corrupted), PC's next write blocks on CTS, and both sides
+; deadlock.
+;
+; For local-CRT users (original console != TTY) we still go through BDOS
+; with the original IOBYTE so the message reaches their physical console.
+; ============================================================================
+print_user_msg
+                ; CON=TTY ⇒ wire-direct via uart_tx (no BIOS, has 330ms timeout)
+                LD	A, (iobyte_saved)
+                AND	0x03            ; CON field (bits 0-1)
+                JR	NZ, .via_bios
+
+                PUSH	DE
+.uart_loop
+                LD	A, (DE)
+                CP	'$'
+                JR	Z, .uart_done
+                CALL	uart_tx
+                INC	DE
+                JR	.uart_loop
+.uart_done
+                POP	DE
+                RET
+
+.via_bios
+                ; Local-console user: route through BDOS with the user's
+                ; original IOBYTE so it reaches their physical CON.
+                LD	HL, IOBYTE
+                LD	A, (HL)
+                PUSH	AF              ; save current (redirect) value
+                LD	A, (iobyte_saved)
+                LD	(HL), A
+
+                LD	C, C_WRITESTR
+                CALL	BDOS
+
+                POP	AF
+                LD	HL, IOBYTE
+                LD	(HL), A
+                RET
+
+; ============================================================================
 ; Messages
 ; ============================================================================
-msg_banner_recv DB	"SLIDE v0.5 - Receive mode", 13, 10, '$'
-msg_banner_send DB	"SLIDE v0.5 - Send mode", 13, 10, '$'
+msg_banner_recv DB	"SLIDE v0.5.1 - Receive mode", 13, 10, '$'
+msg_banner_send DB	"SLIDE v0.5.1 - Send mode", 13, 10, '$'
 msg_sending     DB	"Sending: ", '$'
 msg_done        DB	13, 10, "Transfer complete!", 13, 10, '$'
 msg_done_session DB	13, 10, "Session complete.", 13, 10, '$'
