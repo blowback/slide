@@ -1,6 +1,7 @@
 mod protocol;
 mod send;
 mod recv;
+mod probe;
 
 use clap::{Parser, Subcommand};
 
@@ -41,6 +42,33 @@ enum Commands {
         #[arg(long)]
         debug: bool,
     },
+    /// Probe a peer for v0.3 command-channel support (wire v0.3 §2)
+    Probe {
+        /// Serial port (e.g., /dev/ttyUSB0, COM3)
+        port: String,
+        /// Baud rate
+        #[arg(long, default_value_t = 19200)]
+        baud: u32,
+        /// Probe attempts before giving up
+        #[arg(long, default_value_t = 3)]
+        attempts: u32,
+        /// Milliseconds to wait for each echo
+        #[arg(long, default_value_t = 500)]
+        timeout: u64,
+        /// Milliseconds to wait after handshake before probing, to clear
+        /// the post-RDY FIFO flush
+        #[arg(long, default_value_t = 100)]
+        settle: u64,
+        /// After probing, send FILE to prove the session still works
+        #[arg(long, value_name = "FILE")]
+        then_send: Option<String>,
+        /// Leave the peer in its file loop instead of closing
+        #[arg(long)]
+        no_fin: bool,
+        /// Show wire-level debug output
+        #[arg(long)]
+        debug: bool,
+    },
 }
 
 fn main() {
@@ -51,6 +79,10 @@ fn main() {
         }
         Commands::Recv { port, baud, output_dir, debug } => {
             recv::recv_session(&port, baud, &output_dir, debug)
+        }
+        Commands::Probe { port, baud, attempts, timeout, settle, then_send, no_fin, debug } => {
+            probe::probe_session(&port, baud, attempts, timeout, settle,
+                                 then_send.as_deref(), no_fin, debug)
         }
     };
     if let Err(e) = result {

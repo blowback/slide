@@ -1,5 +1,5 @@
 ; ============================================================================
-; SLIDE v0.5.1 - Serial Line Inter-Device (file) Exchange
+; SLIDE v0.5.2 - Serial Line Inter-Device (file) Exchange
 ; Custom file transfer protocol for Z80 / CP/M (wire protocol v0.2.1)
 ; Target: 8MHz Z80, TL16C550 UART with 16-byte FIFO, auto RTS/CTS flow control
 ;
@@ -7,6 +7,10 @@
 ;         SLIDE R            — receive mode (explicit)
 ;         SLIDE S FILE.COM   — send FILE.COM to PC
 ;         SLIDE S A.COM B.DAT — send multiple files
+;
+; v0.5.2: zero-pad the final partial record on receive, so the unused tail
+;   of the last 128-byte sector is deterministic instead of leaking stale
+;   RXBUF data to disk. Round-tripped files now match the source byte-for-byte.
 ;
 ; v0.2.1 amendments (vs v0.2):
 ;   §1 Wakeup signature: emit ESC ^ S L I D E on entering SLIDE mode,
@@ -1101,6 +1105,25 @@ retry_count     DB	0
 ; Flush buffer to disk via CP/M sequential writes
 ; ============================================================================
 flush_to_disk
+                ; zero-pad the final partial record: F_WRITE always emits a
+                ; full 128-byte sector, so the unused tail past EOF would
+                ; otherwise leak stale RXBUF data to disk. Only fires on the
+                ; EOF flush — intermediate flushes are exactly FLUSH_SIZE.
+                LD	HL, (buf_used)
+                LD	A, L
+                AND	0x7F             ; buf_used mod 128 (bytes in final record)
+                JR	Z, .no_pad       ; exact multiple -> nothing to pad
+                LD	C, A
+                LD	A, 128
+                SUB	C
+                LD	B, A             ; B = 128 - (buf_used mod 128) = pad count
+                LD	DE, RXBUF
+                ADD	HL, DE           ; HL = RXBUF + buf_used = first pad byte
+.pad_loop
+                LD	(HL), 0
+                INC	HL
+                DJNZ	.pad_loop
+.no_pad
                 LD	HL, RXBUF
                 LD	DE, (buf_used)
 
@@ -1937,8 +1960,8 @@ print_user_msg
 ; ============================================================================
 ; Messages
 ; ============================================================================
-msg_banner_recv DB	"SLIDE v0.5.1 - Receive mode", 13, 10, '$'
-msg_banner_send DB	"SLIDE v0.5.1 - Send mode", 13, 10, '$'
+msg_banner_recv DB	"SLIDE v0.5.2 - Receive mode", 13, 10, '$'
+msg_banner_send DB	"SLIDE v0.5.2 - Send mode", 13, 10, '$'
 msg_sending     DB	"Sending: ", '$'
 msg_done        DB	13, 10, "Transfer complete!", 13, 10, '$'
 msg_done_session DB	13, 10, "Session complete.", 13, 10, '$'

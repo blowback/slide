@@ -96,7 +96,7 @@ pub fn send_session(port_name: &str, files: &[String], baud: u32, debug: bool) -
     Ok(())
 }
 
-fn send_file(port: &mut dyn serialport::SerialPort, filename: &str, debug: bool) -> Result<u64> {
+pub(crate) fn send_file(port: &mut dyn serialport::SerialPort, filename: &str, debug: bool) -> Result<u64> {
     let file_data_raw = fs::read(filename).context("Reading file")?;
     let filesize = file_data_raw.len() as u32;
 
