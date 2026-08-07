@@ -23,7 +23,8 @@ from slide.common import (
     CTRL_ENQ, CTRL_FIN, CTRL_CAN,
     CMDSET_MAJOR, CMDSET_MINOR,
     ProbeOutcome,
-    open_serial, handshake_as_sender, probe_command_support, recv_control,
+    open_serial, handshake_as_sender, send_start_command,
+    probe_command_support, recv_control,
 )
 
 
@@ -31,12 +32,13 @@ def _hex(b: bytes) -> str:
     return b.hex(' ') if b else '(none)'
 
 
-def report(result) -> None:
+def report(result, label: str) -> None:
     """Print the probe verdict and the raw evidence behind it."""
     print()
-    print("--- Probe result ---")
+    print(f"--- Probe result ({label}) ---")
     print(f"  Outcome:  {result.outcome.value}")
     print(f"  Attempts: {result.attempts}")
+    print(f"  Queued before probe: {_hex(result.discarded)}")
     print(f"  Stray bytes during probe window: {_hex(result.stray)}")
 
     if result.outcome is ProbeOutcome.SUPPORTED:
@@ -83,7 +85,8 @@ def report(result) -> None:
 
 def probe_session(port: str, baud: int = 19200, attempts: int = 3,
                   echo_timeout: float = 0.5, settle: float = 0.1,
-                  then_send: str = None, skip_fin: bool = False,
+                  start_cmd: str = None, then_send: str = None,
+                  probe_after: bool = False, skip_fin: bool = False,
                   debug: bool = False) -> int:
     """Handshake, probe, optionally transfer a file, then close the session."""
 
@@ -95,18 +98,25 @@ def probe_session(port: str, baud: int = 19200, attempts: int = 3,
 
     ser = open_serial(port, baud)
 
-    print("Waiting for Z80 (start SLIDE R on Z80 now)...")
-    if not handshake_as_sender(ser, timeout=60.0):
+    if start_cmd:
+        print(f"Typing {start_cmd!r} at the CP/M prompt...")
+        send_start_command(ser, start_cmd, debug)
+    else:
+        print("Waiting for Z80 (start SLIDE R on Z80 now)...")
+
+    hs = handshake_as_sender(ser, timeout=60.0, debug=debug)
+    if not hs.connected:
         print("ERROR: no RDY echo from Z80 (handshake timeout or cancel).")
         ser.close()
         return 1
-    print("Z80 connected.")
+    print(f"Z80 connected. ({hs.strays} stray byte(s) skipped, "
+          f"wakeup signature {'seen' if hs.wakeup_seen else 'not seen'})")
 
     # The probe goes exactly where a file header or FIN would go.
     result = probe_command_support(ser, attempts=attempts,
                                    echo_timeout=echo_timeout,
                                    settle=settle, debug=debug)
-    report(result)
+    report(result, "after handshake")
 
     if result.outcome is ProbeOutcome.CANCELLED:
         ser.close()
@@ -121,6 +131,28 @@ def probe_session(port: str, baud: int = 19200, attempts: int = 3,
         if not send_file(ser, then_send, debug):
             print("  File transfer FAILED after the probe.")
             session_ok = False
+        print()
+
+    # v0.3 §2 lists three legal probe positions. The one above covers
+    # "right after the RDY handshake"; this covers "after a completed file
+    # transfer", where the residue risk is different — in receive mode the
+    # preceding transfer's ACKs flow *from* the server, so anything the
+    # client left unread lands in this probe's window.
+    if probe_after:
+        if not then_send:
+            print("Note: --probe-after without --then-send re-probes the same position.")
+        after = probe_command_support(ser, attempts=attempts,
+                                      echo_timeout=echo_timeout,
+                                      settle=settle, debug=debug)
+        report(after, "after file transfer")
+        if after.outcome is ProbeOutcome.CANCELLED:
+            ser.close()
+            return 1
+        if after.outcome is not result.outcome:
+            print("  NOTE: post-transfer outcome differs from the post-handshake one.")
+        if after.discarded:
+            print(f"  NOTE: {len(after.discarded)} byte(s) were still queued "
+                  f"from the transfer.")
         print()
 
     if skip_fin:
@@ -174,8 +206,15 @@ def main():
     parser.add_argument('--settle', type=float, default=0.1,
                         help='Seconds to wait after handshake before probing, '
                              'to clear the post-RDY FIFO flush (default: 0.1)')
+    parser.add_argument('--start-cmd', metavar='CMD',
+                        help="Type this at the peer's CP/M prompt to start it, "
+                             "instead of requiring a separate terminal "
+                             "(e.g. 'slide r' or 'b:slide r')")
     parser.add_argument('--then-send', metavar='FILE',
                         help='After probing, send FILE to prove the session still works')
+    parser.add_argument('--probe-after', action='store_true',
+                        help='Probe again after the file transfer, covering the '
+                             'v0.3 §2 post-transfer position (use with --then-send)')
     parser.add_argument('--no-fin', action='store_true',
                         help='Leave the peer in its file loop instead of closing')
     parser.add_argument('--debug', action='store_true',
@@ -187,7 +226,8 @@ def main():
         sys.exit(1)
 
     sys.exit(probe_session(args.port, args.baud, args.attempts, args.timeout,
-                           args.settle, args.then_send, args.no_fin, args.debug))
+                           args.settle, args.start_cmd, args.then_send,
+                           args.probe_after, args.no_fin, args.debug))
 
 
 if __name__ == '__main__':

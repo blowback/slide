@@ -18,7 +18,6 @@ pub const FRAME_SIZE: usize = 1024;
 /// v0.2.1 §1: Z80 emits this 7-byte signature on entering SLIDE mode,
 /// before any RDY/control/payload. PCs may use it as a liveness signal;
 /// they MUST tolerate it appearing on the wire as non-SOF / non-control bytes.
-#[allow(dead_code)]
 pub const WAKEUP_SIG: [u8; 7] = [0x1B, 0x5E, b'S', b'L', b'I', b'D', b'E'];
 
 /// v0.2.1 §2: echo CTRL_CAN back to the peer within ~500 ms, then drain
@@ -95,6 +94,28 @@ pub(crate) fn read_byte_timeout(port: &mut dyn serialport::SerialPort, timeout: 
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Read and return everything currently queued, stopping once the line has
+/// been quiet for `quiet` or `cap` has elapsed overall.
+///
+/// Used in place of a blind input-buffer clear where the residue itself is
+/// diagnostic: leftovers from a previous exchange become visible instead of
+/// vanishing, while still being removed before the next exchange starts.
+pub fn drain_and_capture(
+    port: &mut dyn serialport::SerialPort,
+    quiet: Duration,
+    cap: Duration,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let deadline = Instant::now() + cap;
+    while Instant::now() < deadline {
+        match read_byte_timeout(port, quiet)? {
+            Some(b) => out.push(b),
+            None => break,
+        }
+    }
+    Ok(out)
 }
 
 /// Wait for a control byte (ACK/NAK/RDY/CAN/FIN) from the remote side.
@@ -249,35 +270,119 @@ pub fn open_serial(port_name: &str, baud: u32) -> Result<Box<dyn serialport::Ser
     Ok(port)
 }
 
+/// Type a command at the peer's CP/M prompt.
+///
+/// On a MicroBeast the CP/M console *is* this UART, so writing the text
+/// here is exactly equivalent to typing it in a terminal. That matters for
+/// tools that own the serial port: there is otherwise no moment when both
+/// a terminal emulator and this program can hold the line, and the v0.2.1
+/// §1 wakeup contract needs the host asserting RTS *before* the Z80 enters
+/// SLIDE mode. Driving the prompt ourselves satisfies both.
+pub fn send_start_command(
+    port: &mut dyn serialport::SerialPort,
+    cmd: &str,
+    debug: bool,
+) -> Result<()> {
+    // A bare CR first clears any half-typed line at the CCP prompt and
+    // draws a fresh one; drop whatever that echoes before sending the
+    // command proper.
+    port.write_all(b"\r")?;
+    port.flush()?;
+    thread::sleep(Duration::from_millis(250));
+    port.clear(serialport::ClearBuffer::Input)?;
+
+    if debug {
+        eprintln!("    DEBUG typing at CP/M prompt: {cmd:?}");
+    }
+    port.write_all(cmd.as_bytes())?;
+    port.write_all(b"\r")?;
+    port.flush()?;
+    Ok(())
+}
+
+/// Outcome of the sender-side RDY handshake.
+#[derive(Debug, Clone, Default)]
+pub struct HandshakeResult {
+    pub connected: bool,
+    /// v0.2.1 §1 wakeup signature observed while waiting for RDY.
+    pub wakeup_seen: bool,
+    /// Count of non-control bytes skipped (banner text, command echo).
+    pub strays: usize,
+}
+
 /// v0.2 §"Startup handshake": the sender transmits RDY first and the
-/// receiver echoes it back. Returns Ok(true) once the echo arrives, or
-/// Ok(false) if the peer cancelled or no echo arrived within `timeout`.
+/// receiver echoes it back.
 pub fn handshake_as_sender(
     port: &mut dyn serialport::SerialPort,
     timeout: Duration,
-) -> Result<bool> {
+    debug: bool,
+) -> Result<HandshakeResult> {
+    let mut result = HandshakeResult::default();
+    let mut wakeup_pos = 0usize;
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         port.write_all(&[CTRL_RDY])?;
         port.flush()?;
-        thread::sleep(Duration::from_secs(1));
+        if debug {
+            eprintln!("    DEBUG handshake: sent RDY, listening for 1s");
+        }
 
-        match read_byte_timeout(port, Duration::from_secs(1))? {
-            Some(CTRL_RDY) => {
-                // v0.2.1 §1 wakeup bytes and RDY retries may still be queued
-                thread::sleep(Duration::from_millis(50));
-                port.clear(serialport::ClearBuffer::Input)?;
-                return Ok(true);
+        // Drain everything that arrives in this window rather than testing a
+        // single byte. The Z80 prints its banner and emits the v0.2.1 §1
+        // wakeup signature before its RDY, so tens of stray bytes precede
+        // the echo — one-byte-per-round would take tens of seconds.
+        let window = Instant::now() + Duration::from_secs(1);
+        loop {
+            let remaining = window.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-            Some(CTRL_CAN) => {
-                echo_can_and_drain(port)?;
-                return Ok(false);
+            let Some(b) = read_byte_timeout(port, remaining)? else {
+                break;
+            };
+            match b {
+                CTRL_RDY => {
+                    // v0.2.1 §1 wakeup bytes and RDY retries may still be queued
+                    thread::sleep(Duration::from_millis(50));
+                    port.clear(serialport::ClearBuffer::Input)?;
+                    result.connected = true;
+                    return Ok(result);
+                }
+                CTRL_CAN => {
+                    echo_can_and_drain(port)?;
+                    return Ok(result);
+                }
+                other => {
+                    result.strays += 1;
+                    // Log the byte before testing it, so the completion
+                    // notice below lands after the byte that completed the
+                    // match rather than appearing to jump a byte early.
+                    if debug {
+                        let ch = if other.is_ascii_graphic() || other == b' ' {
+                            other as char
+                        } else {
+                            '.'
+                        };
+                        eprintln!("    DEBUG handshake stray 0x{other:02X} '{ch}'");
+                    }
+                    // Rolling match for the v0.2.1 §1 wakeup signature.
+                    if other == WAKEUP_SIG[wakeup_pos] {
+                        wakeup_pos += 1;
+                        if wakeup_pos == WAKEUP_SIG.len() {
+                            result.wakeup_seen = true;
+                            wakeup_pos = 0;
+                            if debug {
+                                eprintln!("    DEBUG ^ completed the wakeup signature (v0.2.1 §1)");
+                            }
+                        }
+                    } else {
+                        wakeup_pos = usize::from(other == WAKEUP_SIG[0]);
+                    }
+                }
             }
-            // stray byte (wakeup signature, banner text) or timeout — retry
-            _ => continue,
         }
     }
-    Ok(false)
+    Ok(result)
 }
 
 // ============================================================================
@@ -308,6 +413,11 @@ pub struct ProbeResult {
     pub outcome: ProbeOutcome,
     /// Non-ENQ bytes seen during the probe window.
     pub stray: Vec<u8>,
+    /// Bytes already queued before the probe went out — residue from a
+    /// previous exchange. Captured rather than blindly cleared so it is
+    /// visible, but still removed before probing: an unconsumed `ACK 5` is
+    /// the bytes `06 05`, and that `0x05` would otherwise read as an echo.
+    pub discarded: Vec<u8>,
     pub attempts: u32,
 }
 
@@ -348,7 +458,17 @@ pub fn probe_command_support(
     if !settle.is_zero() {
         thread::sleep(settle);
     }
-    port.clear(serialport::ClearBuffer::Input)?;
+    let discarded = drain_and_capture(
+        port,
+        Duration::from_millis(50),
+        Duration::from_millis(500),
+    )?;
+    if debug && !discarded.is_empty() {
+        eprintln!(
+            "    DEBUG discarded {} queued byte(s) before probing",
+            discarded.len()
+        );
+    }
 
     for attempt in 1..=attempts {
         if debug {
@@ -373,13 +493,14 @@ pub fn probe_command_support(
                         eprintln!("    DEBUG got ENQ echo, reading {CMDSET_VER_LEN} VER bytes");
                     }
                     let outcome = read_version(port, echo_timeout, debug)?;
-                    return Ok(ProbeResult { outcome, stray, attempts: attempt });
+                    return Ok(ProbeResult { outcome, stray, discarded, attempts: attempt });
                 }
                 CTRL_CAN => {
                     echo_can_and_drain(port)?;
                     return Ok(ProbeResult {
                         outcome: ProbeOutcome::Cancelled,
                         stray,
+                        discarded,
                         attempts: attempt,
                     });
                 }
@@ -398,6 +519,7 @@ pub fn probe_command_support(
     Ok(ProbeResult {
         outcome: ProbeOutcome::Unsupported,
         stray,
+        discarded,
         attempts,
     })
 }
@@ -502,6 +624,7 @@ mod tests {
                 ver_raw: b"0000".to_vec(),
             },
             stray: vec![],
+            discarded: vec![],
             attempts: 1,
         };
         // Known major — usable, whatever the minor. v0.3 §2: the command
@@ -520,7 +643,7 @@ mod tests {
                 reason: String::new(),
             },
         ] {
-            let r = ProbeResult { outcome, stray: vec![], attempts: 1 };
+            let r = ProbeResult { outcome, stray: vec![], discarded: vec![], attempts: 1 };
             assert!(!r.usable());
         }
     }

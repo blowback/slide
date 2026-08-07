@@ -246,6 +246,23 @@ each record frame's payload length is an exact multiple of the record
 size. This keeps both the server's emit loop and the client's parser
 trivial.
 
+### Ending a session after a command
+
+A client MAY end the session immediately after a command exchange, with
+no file transferred at all. `CTRL_FIN` is tested before `SOF` in the
+server's file loop (`slide.asm:884`), and the FIN handler has no
+precondition about having received anything, so a
+handshake → command → FIN session is well formed and exits cleanly.
+Nothing is created on the server's disk either: file creation only
+happens on the header-frame path.
+
+Ending the session means **sending `CTRL_FIN`**, not merely closing the
+port. The server's file loop retries indefinitely on timeout
+(`slide.asm:883`) — unlike the handshake, it has no retry budget — so a
+client that just disconnects leaves `slide.com` waiting until someone
+intervenes at the keyboard. `CTRL_CAN` is an equally valid exit. Silence
+is not.
+
 ## §5. The commands
 
 ### `CMD_VOLS` (0x01)
@@ -376,13 +393,70 @@ CAN, take the echo, drop the session.
 | v0.3    | v0.2.1  | Probe ignored; no echo; client falls back to file transfer or FIN. Server never leaves its file loop. Session undamaged. |
 | v0.2.1  | v0.3    | Client never sends `CTRL_ENQ`; server never enters command mode. Behaviour bit-identical to v0.2.1. |
 
-The wakeup signature (v0.2.1 §1) is **not** a usable capability signal
-and MUST NOT be used as one. `send_wakeup` transmits via `uart_tx`, which
-auto-flow-control blocks while CTS is low; if the host is not already
-asserting RTS when the user starts `SLIDE R`, at most the leading `0x1B`
-reaches the wire and the remaining six bytes time out silently. That is
-exactly the remote-filing case — host attaches, then drives a Z80 already
-sitting in receive mode. Treat the signature as a liveness hint only.
+### Verification status
+
+The `v0.3 client → v0.2.1 server` row is **measured, not inferred**. The
+reference probe (`slide probe`, `slide-rs`) was run against `slide.com`
+v0.5.2 on MicroBeast hardware at 19200 baud on 2026-08-07 and
+2026-08-08. Confirmed:
+
+- **`CTRL_ENQ` is inert.** Three attempts drew no echo and **no bytes
+  whatsoever** — the server emitted nothing at all, not merely nothing
+  recognisable.
+- **The probe leaves no residue.** A `CTRL_FIN` sent straight afterwards
+  was echoed normally, so the server was still in its file loop and
+  exited cleanly.
+- **Fall-back to ordinary file transfer works.** A 2845-byte file sent
+  immediately after an ignored probe transferred and was ACKed normally,
+  followed by a clean FIN exchange. Three skipped `CTRL_ENQ` bytes leave
+  no state that disturbs a following header frame.
+- **The §4 zero-file session is well formed.** handshake → probe → FIN
+  with nothing transferred exits cleanly.
+- **Probing after a completed file transfer behaves identically.** A
+  second probe issued once the transfer's EOF frame had been ACKed drew
+  the same silence, and the wire was measurably idle going in — nothing
+  was queued ahead of it. In receive mode the preceding transfer's ACKs
+  flow *from* the server, so this confirms the client had consumed them
+  all and that the position is as clean as the post-handshake one.
+- **The v0.2.1 §1 wakeup signature arrives intact** when the client
+  starts the session itself (see below).
+
+That covers every probe position §2 permits except "after a completed
+command exchange", which cannot be tested until a v0.3 server exists.
+
+Two limits on how far to read the residue result. It was measured on a
+clean transfer with no NAK and no retransmission, so it says nothing
+about the noisy recovery paths. And it was measured with the *client*
+sending frames; the §9 requirement to drain after a reply stream
+concerns the opposite direction, where the server sends and the client
+ACKs, which no implementation exercises yet. Neither is grounds for
+relaxing that requirement.
+
+### The wakeup signature is not a capability signal
+
+The wakeup signature (v0.2.1 §1) MUST NOT be used to detect command
+support. It carries no version, and a host that attaches to an already
+running `SLIDE R` has simply missed it.
+
+Its reliability also depends on who starts the session, which is worth
+stating precisely because it constrains client design:
+
+- **Host attaches to a Z80 already in SLIDE mode** — the signature is
+  unreliable and may be absent entirely. `send_wakeup` transmits via
+  `uart_tx`, which auto-flow-control blocks while CTS is low, so if the
+  host was not asserting RTS when the user started `SLIDE R`, at most the
+  leading `0x1B` reaches the wire and the remaining six bytes time out
+  silently.
+- **Host starts the session itself** — the signature arrives intact,
+  because the host has held RTS from before the Z80 entered SLIDE mode.
+  Confirmed on hardware in the run described above.
+
+On a MicroBeast the second case is the only practical one anyway: the
+CP/M console *is* the SLIDE UART, so a host tool that opens the port
+takes away the terminal the operator would have used to type `SLIDE R`.
+Clients should type the command at the CP/M prompt themselves (see §9),
+which incidentally makes the signature dependable as a liveness and
+mode-entry confirmation — just never as a capability or version check.
 
 ## §9. Implementation notes
 
@@ -404,11 +478,36 @@ sitting in receive mode. Treat the signature as a liveness hint only.
   (`expected_seq`, `buf_ptr`, `buf_used`, `retry_count`) as the file loop
   expects it — either untouched, or reset the same way as the per-file
   reset block at `slide.asm:917`.
+- Emit whole records only. Fill up to 64 records, send the frame, repeat.
 - `CMD_DIR` needs a second FCB and its own DMA buffer for the search, or
   careful save/restore of the default DMA address at `0x0080` — the
   command tail lives there and is no longer needed by then, but
   `create_file` and friends assume the standard DMA setup.
-- Emit whole records only. Fill up to 64 records, send the frame, repeat.
+
+#### Draining after a reply stream (required)
+
+A server MUST `CALL uart_flush_rx` when a command reply completes, before
+returning to the file loop.
+
+This closes a hazard the command channel creates. In v0.2.1 receive mode
+the Z80 never sends frames, so it never consumes ACKs, so no ACK can ever
+be sitting unread when `.file_loop` next reads a byte. A reply stream
+changes that: if the exchange hit a NAK or a retransmit, the client may
+have queued more ACKs than the server's send loop consumed.
+
+The leftovers are not harmless. `.file_loop` skips a stray `CTRL_ACK`
+(`0x06`) because it matches none of its tests — and then reads the
+**sequence byte** behind it, which is unconstrained. A queued `ACK 1`
+leaves `0x01` next in line, which reads as `SOF`, and the server starts
+parsing a frame out of residue with `rx_len` taken from whatever follows.
+A queued `ACK 4` reads as `FIN` and ends the session early. Neither
+failure is detectable by CRC, because the frame the server thinks it is
+reading never existed.
+
+One flush call removes the whole class. The same argument applies to the
+existing send path, where it is noted as optional hardening
+(`docs/IDEAS.md`); here it is required, because the reply stream is what
+puts ACKs in flight during receive mode in the first place.
 
 ### PC (`slide-py`, `slide-rs`)
 
@@ -421,6 +520,36 @@ sitting in receive mode. Treat the signature as a liveness hint only.
 - Clients SHOULD cache the probe result per session — but MUST still
   send `CTRL_ENQ` before each command frame, since it is the server's
   only signal that the next frame is not a file header.
+
+#### Starting the server when the console is the same UART
+
+On a MicroBeast the CP/M console *is* the SLIDE UART, so there is no
+moment at which both a terminal emulator and a SLIDE client can hold the
+line. "Start the client, then type `SLIDE R`" is not a workflow the
+operator can physically perform: opening the port removes the terminal
+they would type into.
+
+Clients SHOULD therefore be able to type the start command themselves.
+CP/M reads its command line from the console, so writing the text to the
+port is indistinguishable from typing it:
+
+1. Write a bare `CR` to clear any half-typed line and draw a fresh
+   prompt.
+2. Wait ~250 ms, then discard whatever that echoed.
+3. Write the command (`SLIDE R`) followed by `CR`.
+4. Proceed to the RDY handshake.
+
+This also satisfies the v0.2.1 §1 RTS ordering requirement for free: the
+port is open, and RTS asserted, before the Z80 enters SLIDE mode.
+
+Two consequences for the handshake that follows. The client will see the
+command echo, the CP/M banner and the wakeup signature — several dozen
+stray bytes — before the peer's RDY, so the handshake MUST drain
+everything available in each listening window rather than testing a
+single byte per retry. And the first RDY may be written while CP/M is
+still loading `SLIDE.COM` from disk, so it can be lost to the UART
+initialisation in `slide.com`; the client's existing RDY retry covers
+this, but a client that sends RDY only once will hang.
 
 ## §10. Worked example
 

@@ -115,34 +115,94 @@ def open_serial(port: str, baud: int = 19200) -> serial.Serial:
     return ser
 
 
-def handshake_as_sender(ser: serial.Serial, timeout: float = 60.0) -> bool:
+def send_start_command(ser: serial.Serial, cmd: str, debug: bool = False) -> None:
+    """
+    Type a command at the peer's CP/M prompt.
+
+    On a MicroBeast the CP/M console *is* this UART, so writing the text
+    here is exactly equivalent to typing it in a terminal. That matters for
+    tools that own the serial port: there is otherwise no moment when both
+    a terminal emulator and this program can hold the line, and the v0.2.1
+    §1 wakeup contract needs the host asserting RTS *before* the Z80 enters
+    SLIDE mode. Driving the prompt ourselves satisfies both.
+    """
+    # A bare CR first clears any half-typed line at the CCP prompt and
+    # draws a fresh one; drop whatever that echoes before sending the
+    # command proper.
+    ser.write(b'\r')
+    ser.flush()
+    time.sleep(0.25)
+    ser.reset_input_buffer()
+
+    if debug:
+        print(f"    DEBUG typing at CP/M prompt: {cmd!r}")
+    ser.write(cmd.encode('ascii') + b'\r')
+    ser.flush()
+
+
+@dataclass
+class HandshakeResult:
+    connected: bool = False
+    wakeup_seen: bool = False   # v0.2.1 §1 signature observed while waiting
+    strays: int = 0             # non-control bytes skipped (banner, echo)
+
+
+def handshake_as_sender(ser: serial.Serial, timeout: float = 60.0,
+                        debug: bool = False) -> HandshakeResult:
     """
     v0.2 §"Startup handshake": the sender transmits RDY first and the
-    receiver echoes it back. Returns True once the echo arrives.
-
-    Returns False if the peer sent CAN (already echoed and drained) or if
-    no echo arrived within `timeout`.
+    receiver echoes it back.
     """
+    result = HandshakeResult()
+    wakeup_pos = 0
     deadline = time.time() + timeout
     while time.time() < deadline:
         ser.write(bytes([CTRL_RDY]))
         ser.flush()
-        time.sleep(1.0)
+        if debug:
+            print("    DEBUG handshake: sent RDY, listening for 1s")
 
-        ser.timeout = 1.0
-        b = ser.read(1)
-        if not b:
-            continue
-        if b[0] == CTRL_RDY:
-            # v0.2.1 §1 wakeup bytes and RDY retries may still be queued
-            time.sleep(0.05)
-            ser.reset_input_buffer()
-            return True
-        if b[0] == CTRL_CAN:
-            _echo_can_and_drain(ser)
-            return False
-        # else: stray byte (wakeup signature, banner text) — keep trying
-    return False
+        # Drain everything that arrives in this window rather than testing a
+        # single byte. The Z80 prints its banner and emits the v0.2.1 §1
+        # wakeup signature before its RDY, so tens of stray bytes precede
+        # the echo — one-byte-per-round would take tens of seconds.
+        window = time.time() + 1.0
+        while True:
+            remaining = window - time.time()
+            if remaining <= 0:
+                break
+            b = _read_byte(ser, remaining)
+            if b is None:
+                break
+            if b == CTRL_RDY:
+                # v0.2.1 §1 wakeup bytes and RDY retries may still be queued
+                time.sleep(0.05)
+                ser.reset_input_buffer()
+                result.connected = True
+                return result
+            if b == CTRL_CAN:
+                _echo_can_and_drain(ser)
+                return result
+
+            result.strays += 1
+            # Log the byte before testing it, so the completion notice below
+            # lands after the byte that completed the match rather than
+            # appearing to jump a byte early.
+            if debug:
+                ch = chr(b) if 0x20 <= b < 0x7F else '.'
+                print(f"    DEBUG handshake stray 0x{b:02X} '{ch}'")
+
+            # Rolling match for the v0.2.1 §1 wakeup signature.
+            if b == WAKEUP_SIG[wakeup_pos]:
+                wakeup_pos += 1
+                if wakeup_pos == len(WAKEUP_SIG):
+                    result.wakeup_seen = True
+                    wakeup_pos = 0
+                    if debug:
+                        print("    DEBUG ^ completed the wakeup signature (v0.2.1 §1)")
+            else:
+                wakeup_pos = 1 if b == WAKEUP_SIG[0] else 0
+    return result
 
 
 # ============================================================================
@@ -168,6 +228,11 @@ class ProbeResult:
     minor: int = None
     ver_raw: bytes = b''
     stray: bytes = b''      # non-ENQ bytes seen during the probe window
+    # Bytes already queued before the probe went out — residue from a
+    # previous exchange. Captured rather than blindly cleared so it is
+    # visible, but still removed before probing: an unconsumed `ACK 5` is
+    # the bytes `06 05`, and that 0x05 would otherwise read as an echo.
+    discarded: bytes = b''
     attempts: int = 0
     detail: str = ''
 
@@ -186,6 +251,26 @@ def _read_byte(ser: serial.Serial, timeout: float):
     ser.timeout = max(timeout, 0.0)
     b = ser.read(1)
     return b[0] if b else None
+
+
+def drain_and_capture(ser: serial.Serial, quiet: float = 0.05,
+                      cap: float = 0.5) -> bytes:
+    """
+    Read and return everything currently queued, stopping once the line has
+    been quiet for `quiet` or `cap` has elapsed overall.
+
+    Used in place of a blind input-buffer clear where the residue itself is
+    diagnostic: leftovers from a previous exchange become visible instead of
+    vanishing, while still being removed before the next exchange starts.
+    """
+    out = bytearray()
+    deadline = time.time() + cap
+    while time.time() < deadline:
+        b = _read_byte(ser, quiet)
+        if b is None:
+            break
+        out.append(b)
+    return bytes(out)
 
 
 def probe_command_support(ser: serial.Serial, attempts: int = 3,
@@ -214,7 +299,9 @@ def probe_command_support(ser: serial.Serial, attempts: int = 3,
     try:
         if settle > 0:
             time.sleep(settle)
-        ser.reset_input_buffer()
+        discarded = drain_and_capture(ser)
+        if debug and discarded:
+            print(f"    DEBUG discarded {len(discarded)} queued byte(s) before probing")
 
         for attempt in range(1, attempts + 1):
             if debug:
@@ -234,13 +321,15 @@ def probe_command_support(ser: serial.Serial, attempts: int = 3,
                 if b == CTRL_ENQ:
                     if debug:
                         print(f"    DEBUG got ENQ echo, reading {CMDSET_VER_LEN} VER bytes")
-                    return _read_version(ser, echo_timeout, stray, attempt, debug)
+                    return _read_version(ser, echo_timeout, stray, discarded,
+                                         attempt, debug)
 
                 if b == CTRL_CAN:
                     _echo_can_and_drain(ser)
                     return ProbeResult(
                         outcome=ProbeOutcome.CANCELLED,
                         stray=bytes(stray),
+                        discarded=discarded,
                         attempts=attempt,
                         detail="peer sent CAN during the probe window",
                     )
@@ -254,6 +343,7 @@ def probe_command_support(ser: serial.Serial, attempts: int = 3,
         return ProbeResult(
             outcome=ProbeOutcome.UNSUPPORTED,
             stray=bytes(stray),
+            discarded=discarded,
             attempts=attempts,
             detail="no ENQ echo — peer does not implement the v0.3 command channel",
         )
@@ -262,7 +352,7 @@ def probe_command_support(ser: serial.Serial, attempts: int = 3,
 
 
 def _read_version(ser: serial.Serial, timeout: float, stray: bytearray,
-                  attempt: int, debug: bool) -> ProbeResult:
+                  discarded: bytes, attempt: int, debug: bool) -> ProbeResult:
     """Read and validate the 4-byte VER field following an ENQ echo."""
     ver = bytearray()
     deadline = time.time() + timeout
@@ -280,6 +370,7 @@ def _read_version(ser: serial.Serial, timeout: float, stray: bytearray,
             outcome=ProbeOutcome.MALFORMED,
             ver_raw=bytes(ver),
             stray=bytes(stray),
+            discarded=discarded,
             attempts=attempt,
             detail=f"VER truncated: got {len(ver)} of {CMDSET_VER_LEN} bytes",
         )
@@ -289,6 +380,7 @@ def _read_version(ser: serial.Serial, timeout: float, stray: bytearray,
             outcome=ProbeOutcome.MALFORMED,
             ver_raw=bytes(ver),
             stray=bytes(stray),
+            discarded=discarded,
             attempts=attempt,
             detail=f"VER is not four ASCII digits: {ver.hex(' ')}",
         )
@@ -304,5 +396,6 @@ def _read_version(ser: serial.Serial, timeout: float, stray: bytearray,
         minor=int(text[2:]),
         ver_raw=bytes(ver),
         stray=bytes(stray),
+        discarded=discarded,
         attempts=attempt,
     )

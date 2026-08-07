@@ -40,11 +40,12 @@ fn outcome_name(outcome: &ProbeOutcome) -> &'static str {
 }
 
 /// Print the probe verdict and the raw evidence behind it.
-fn report(result: &ProbeResult) {
+fn report(result: &ProbeResult, label: &str) {
     println!();
-    println!("{}", style("--- Probe result ---").bold());
+    println!("{}", style(format!("--- Probe result ({label}) ---")).bold());
     println!("  Outcome:  {}", outcome_name(&result.outcome));
     println!("  Attempts: {}", result.attempts);
+    println!("  Queued before probe: {}", hex(&result.discarded));
     println!("  Stray bytes during probe window: {}", hex(&result.stray));
 
     match &result.outcome {
@@ -104,7 +105,9 @@ pub fn probe_session(
     attempts: u32,
     echo_timeout_ms: u64,
     settle_ms: u64,
+    start_cmd: Option<&str>,
     then_send: Option<&str>,
+    probe_after: bool,
     skip_fin: bool,
     debug: bool,
 ) -> Result<()> {
@@ -126,11 +129,24 @@ pub fn probe_session(
 
     let mut port = open_serial(port_name, baud)?;
 
-    println!("Waiting for Z80 (start SLIDE R on Z80 now)...");
-    if !handshake_as_sender(port.as_mut(), Duration::from_secs(60))? {
+    match start_cmd {
+        Some(cmd) => {
+            println!("Typing {} at the CP/M prompt...", style(cmd).yellow());
+            send_start_command(port.as_mut(), cmd, debug)?;
+        }
+        None => println!("Waiting for Z80 (start SLIDE R on Z80 now)..."),
+    }
+
+    let hs = handshake_as_sender(port.as_mut(), Duration::from_secs(60), debug)?;
+    if !hs.connected {
         bail!("No RDY echo from Z80 (handshake timeout or cancel)");
     }
-    println!("{} Z80 connected.", style("✓").green().bold());
+    println!(
+        "{} Z80 connected. ({} stray byte(s) skipped, wakeup signature {})",
+        style("✓").green().bold(),
+        hs.strays,
+        if hs.wakeup_seen { "seen" } else { "not seen" }
+    );
 
     // The probe goes exactly where a file header or FIN would go.
     let result = probe_command_support(
@@ -140,7 +156,7 @@ pub fn probe_session(
         Duration::from_millis(settle_ms),
         debug,
     )?;
-    report(&result);
+    report(&result, "after handshake");
 
     if result.outcome == ProbeOutcome::Cancelled {
         bail!("Peer cancelled during the probe");
@@ -163,6 +179,46 @@ pub fn probe_session(
                 println!("  File transfer FAILED after the probe: {e:#}");
                 session_ok = false;
             }
+        }
+    }
+
+    // v0.3 §2 lists three legal probe positions. The one above covers
+    // "right after the RDY handshake"; this covers "after a completed file
+    // transfer", where the residue risk is different — in receive mode the
+    // preceding transfer's ACKs flow *from* the server, so anything the
+    // client left unread lands in this probe's window.
+    if probe_after {
+        if then_send.is_none() {
+            println!(
+                "{}",
+                style("Note: --probe-after without --then-send re-probes the same position.")
+                    .yellow()
+            );
+        }
+        let after = probe_command_support(
+            port.as_mut(),
+            attempts,
+            Duration::from_millis(echo_timeout_ms),
+            Duration::from_millis(settle_ms),
+            debug,
+        )?;
+        report(&after, "after file transfer");
+
+        if after.outcome == ProbeOutcome::Cancelled {
+            bail!("Peer cancelled during the post-transfer probe");
+        }
+        if outcome_name(&after.outcome) != outcome_name(&result.outcome) {
+            println!(
+                "  {} post-transfer outcome differs from the post-handshake one.",
+                style("NOTE:").yellow().bold()
+            );
+        }
+        if !after.discarded.is_empty() {
+            println!(
+                "  {} {} byte(s) were still queued from the transfer.",
+                style("NOTE:").yellow().bold(),
+                after.discarded.len()
+            );
         }
     }
 

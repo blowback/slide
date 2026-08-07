@@ -59,9 +59,17 @@ enum Commands {
         /// the post-RDY FIFO flush
         #[arg(long, default_value_t = 100)]
         settle: u64,
+        /// Type this at the peer's CP/M prompt to start it, instead of
+        /// requiring a separate terminal (e.g. "slide r" or "b:slide r")
+        #[arg(long, value_name = "CMD")]
+        start_cmd: Option<String>,
         /// After probing, send FILE to prove the session still works
         #[arg(long, value_name = "FILE")]
         then_send: Option<String>,
+        /// Probe again after the file transfer, covering the v0.3 §2
+        /// post-transfer position (use with --then-send)
+        #[arg(long)]
+        probe_after: bool,
         /// Leave the peer in its file loop instead of closing
         #[arg(long)]
         no_fin: bool,
@@ -80,9 +88,11 @@ fn main() {
         Commands::Recv { port, baud, output_dir, debug } => {
             recv::recv_session(&port, baud, &output_dir, debug)
         }
-        Commands::Probe { port, baud, attempts, timeout, settle, then_send, no_fin, debug } => {
+        Commands::Probe { port, baud, attempts, timeout, settle, start_cmd, then_send,
+                          probe_after, no_fin, debug } => {
             probe::probe_session(&port, baud, attempts, timeout, settle,
-                                 then_send.as_deref(), no_fin, debug)
+                                 start_cmd.as_deref(), then_send.as_deref(),
+                                 probe_after, no_fin, debug)
         }
     };
     if let Err(e) = result {
