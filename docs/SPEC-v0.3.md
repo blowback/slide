@@ -500,7 +500,8 @@ a NanoBeast:
   same 52-file drive: 7 record frames, the last one partial at 64 bytes,
   and the client ACKing at seq 4 and seq 8 so `send_reply_frame` absorbed
   two window ACKs before the terminator. Same code, same data, only the
-  chunk size changed.
+  chunk size changed. 30 consecutive runs at that frame count, no
+  failures.
 
 The intermittent failure that fix addresses is worth remembering as a
 class: a correct-looking reply followed by a silently hung session, where
