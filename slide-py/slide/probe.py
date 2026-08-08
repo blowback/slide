@@ -321,11 +321,12 @@ def main():
                         help='Baud rate (default: 19200)')
     parser.add_argument('--attempts', type=int, default=3,
                         help='Probe attempts before giving up (default: 3)')
-    parser.add_argument('--timeout', type=float, default=0.5,
-                        help='Seconds to wait for each echo (default: 0.5)')
-    parser.add_argument('--settle', type=float, default=0.1,
-                        help='Seconds to wait after handshake before probing, '
-                             'to clear the post-RDY FIFO flush (default: 0.1)')
+    parser.add_argument('--timeout', type=int, default=500,
+                        help='Milliseconds to wait for each echo (default: 500)')
+    parser.add_argument('--settle', type=int, default=100,
+                        help='Milliseconds to wait after handshake before '
+                             'probing, to clear the post-RDY FIFO flush '
+                             '(default: 100)')
     parser.add_argument('--start-cmd', metavar='CMD',
                         help="Type this at the peer's CP/M prompt to start it, "
                              "instead of requiring a separate terminal "
@@ -354,8 +355,9 @@ def main():
         print(f"Error: file '{args.then_send}' not found")
         sys.exit(1)
 
-    sys.exit(probe_session(args.port, args.baud, args.attempts, args.timeout,
-                           args.settle, args.start_cmd, args.cmd,
+    sys.exit(probe_session(args.port, args.baud, args.attempts,
+                           args.timeout / 1000.0, args.settle / 1000.0,
+                           args.start_cmd, args.cmd,
                            args.drive, args.user, args.then_send,
                            args.probe_after, args.no_fin, args.debug))
 

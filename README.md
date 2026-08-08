@@ -192,6 +192,32 @@ and the session carries on as normal — you can still transfer files in the sam
 
 The full protocol is written up in [docs/SPEC-v0.3.md](docs/SPEC-v0.3.md).
 
+### All the options
+
+```
+slide probe <port> [options]
+```
+
+What to run, and where:
+
+- `--cmd nop|vols|dir` — which command to send (default: `nop`, which just asks "do you speak v0.3?" and gets out of the way)
+- `--drive A-P|0-15` — drive to list with `--cmd dir`. Omit for the currently selected one
+- `--user 0-15` — CP/M user number to list. Omit for the current one
+- `--start-cmd "slide r"` — type this at the MicroBeast's CP/M prompt instead of needing a separate terminal
+- `--baud` — baud rate (default: 19200)
+
+Diagnostics, mostly of interest if you're poking at the protocol itself:
+
+- `--then-send FILE` — after probing, send a file, to prove the probe didn't upset the session
+- `--probe-after` — probe a second time after that transfer
+- `--no-fin` — leave the MicroBeast sitting in its file loop instead of closing the session
+- `--attempts N` — how many times to send the probe byte before giving up (default: 3)
+- `--timeout MS` — how long to wait for each reply (default: 500)
+- `--settle MS` — pause after the handshake before probing, so the Z80's FIFO flush doesn't eat the first attempt (default: 100)
+- `--debug` — full wire-level trace: every stray byte, every frame, every ACK
+
+The python scripts take the same options: `uv run slide-probe /dev/ttyUSB0 --cmd dir --drive b:`.
+
 ### Fair warning
 
 `probe` started life as a diagnostic for testing backwards compatibility, and it still prints like one. A friendlier `slide dir` / `slide vols` would be the obvious next step; it doesn't exist yet.
