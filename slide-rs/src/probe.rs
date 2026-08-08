@@ -408,6 +408,20 @@ Re-run with --yes if that is what you want.",
     }
 
     let hs = handshake_as_sender(port.as_mut(), Duration::from_secs(60), debug)?;
+    if hs.saw_ccp_echo {
+        let said: String = hs
+            .chatter
+            .iter()
+            .map(|&b| if (0x20..0x7F).contains(&b) { b as char } else { '.' })
+            .collect();
+        bail!(
+            "The MicroBeast is sitting at a CP/M prompt, not running SLIDE — \
+it echoed our RDY back as ^Q.\n       It said: {}\n       \
+A trailing '?' means CP/M could not find that command; check the name \
+passed to --start-cmd.",
+            said.trim()
+        );
+    }
     if !hs.connected {
         bail!("No RDY echo from Z80 (handshake timeout or cancel)");
     }

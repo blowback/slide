@@ -295,6 +295,15 @@ def probe_session(port: str, baud: int = 19200, attempts: int = 3,
         print("Waiting for Z80 (start SLIDE R on Z80 now)...")
 
     hs = handshake_as_sender(ser, timeout=60.0, debug=debug)
+    if hs.saw_ccp_echo:
+        said = ''.join(chr(c) if 0x20 <= c < 0x7F else '.' for c in hs.chatter)
+        print("ERROR: the MicroBeast is sitting at a CP/M prompt, not running "
+              "SLIDE — it echoed our RDY back as ^Q.")
+        print(f"       It said: {said.strip()}")
+        print("       A trailing '?' means CP/M could not find that command; "
+              "check the name passed to --start-cmd.")
+        ser.close()
+        return 1
     if not hs.connected:
         print("ERROR: no RDY echo from Z80 (handshake timeout or cancel).")
         ser.close()

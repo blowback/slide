@@ -145,6 +145,13 @@ class HandshakeResult:
     connected: bool = False
     wakeup_seen: bool = False   # v0.2.1 §1 signature observed while waiting
     strays: int = 0             # non-control bytes skipped (banner, echo)
+    # The peer echoed our RDY back as "^Q" — RDY is 0x11, which is Ctrl-Q,
+    # and CP/M's command prompt echoes control characters that way. It means
+    # we are talking to the CCP, not to SLIDE.
+    saw_ccp_echo: bool = False
+    # First stretch of stray bytes, so the caller can show what the peer
+    # actually said (typically a banner, or "SLIDE?").
+    chatter: bytes = b''
 
 
 def handshake_as_sender(ser: serial.Serial, timeout: float = 60.0,
@@ -155,6 +162,8 @@ def handshake_as_sender(ser: serial.Serial, timeout: float = 60.0,
     """
     result = HandshakeResult()
     wakeup_pos = 0
+    prev_stray = 0
+    chatter = bytearray()
     deadline = time.time() + timeout
     while time.time() < deadline:
         ser.write(bytes([CTRL_RDY]))
@@ -185,6 +194,14 @@ def handshake_as_sender(ser: serial.Serial, timeout: float = 60.0,
                 return result
 
             result.strays += 1
+            if len(chatter) < 96:
+                chatter.append(b)
+                result.chatter = bytes(chatter)
+            # "^Q" is our own RDY coming back off a CP/M prompt.
+            if prev_stray == ord('^') and b == ord('Q'):
+                result.saw_ccp_echo = True
+                return result
+            prev_stray = b
             # Log the byte before testing it, so the completion notice below
             # lands after the byte that completed the match rather than
             # appearing to jump a byte early.
