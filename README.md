@@ -116,7 +116,7 @@ slide recv --output-dir /tmp /dev/ttyUSB0
 
 ## Remote filing
 
-New in wire protocol v0.3 (`slide.com` v0.6.0). The PC can now ask the MicroBeast what disks it has and what's on them, without transferring a thing.
+New in wire protocol v0.3 (`slide.com` v0.6.1). The PC can now ask the MicroBeast what disks it has and what's on them, without transferring a thing.
 
 Start the MicroBeast in receive mode as usual (`slide`), then on the PC:
 

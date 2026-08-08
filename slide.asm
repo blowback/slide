@@ -1,10 +1,11 @@
 ; ============================================================================
-; SLIDE v0.6.0 - Serial Line Inter-Device (file) Exchange
+; SLIDE v0.6.1 - Serial Line Inter-Device (file) Exchange
 ; Custom file transfer protocol for Z80 / CP/M (wire protocol v0.3)
 ;
 ; v0.6.0: wire v0.3 command channel (see docs/SPEC-v0.3.md). CTRL_ENQ
 ; is answered in the receive-mode file loop; CMD_NOP / CMD_VOLS / CMD_DIR
 ; are served from real BDOS/BIOS enumeration.
+; v0.6.1: adds CMD_DEL and CMD_REN; command set 0001 -> 0002.
 ; Target: 8MHz Z80, TL16C550 UART with 16-byte FIFO, auto RTS/CTS flow control
 ;
 ; Usage:  SLIDE              — receive mode (default)
@@ -3020,8 +3021,8 @@ print_user_msg
 ; ============================================================================
 ; Messages
 ; ============================================================================
-msg_banner_recv DB	"SLIDE v0.6.0 - Receive mode", 13, 10, '$'
-msg_banner_send DB	"SLIDE v0.6.0 - Send mode", 13, 10, '$'
+msg_banner_recv DB	"SLIDE v0.6.1 - Receive mode", 13, 10, '$'
+msg_banner_send DB	"SLIDE v0.6.1 - Send mode", 13, 10, '$'
 msg_sending     DB	"Sending: ", '$'
 msg_done        DB	13, 10, "Transfer complete!", 13, 10, '$'
 msg_done_session DB	13, 10, "Session complete.", 13, 10, '$'

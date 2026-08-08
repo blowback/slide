@@ -841,8 +841,9 @@ frame alone and stream records behind it.
 
 - Wire protocol version: **v0.3**.
 - Command-set version (the `CTRL_ENQ` echo's `VER` field): **`'0002'`**.
-- Reference Z80 application: `slide.com` v0.6 (first version
-  implementing wire v0.3).
+- Reference Z80 application: `slide.com` v0.6.1. v0.6.0 was the first
+  version implementing wire v0.3, at command set `'0001'`; v0.6.1 added
+  `CMD_DEL` and `CMD_REN` at `'0002'`.
 - Compatibility floor: wire v0.2.1 / `slide.com` v0.5.0.
 
 ### Why `VER` is not the wire version
