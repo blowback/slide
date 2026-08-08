@@ -63,6 +63,9 @@ enum Commands {
         /// requiring a separate terminal (e.g. "slide r" or "b:slide r")
         #[arg(long, value_name = "CMD")]
         start_cmd: Option<String>,
+        /// Command to issue if the peer supports them: nop, vols, or dir
+        #[arg(long, default_value = "nop", value_parser = ["nop", "vols", "dir"])]
+        cmd: String,
         /// After probing, send FILE to prove the session still works
         #[arg(long, value_name = "FILE")]
         then_send: Option<String>,
@@ -88,10 +91,10 @@ fn main() {
         Commands::Recv { port, baud, output_dir, debug } => {
             recv::recv_session(&port, baud, &output_dir, debug)
         }
-        Commands::Probe { port, baud, attempts, timeout, settle, start_cmd, then_send,
+        Commands::Probe { port, baud, attempts, timeout, settle, start_cmd, cmd, then_send,
                           probe_after, no_fin, debug } => {
             probe::probe_session(&port, baud, attempts, timeout, settle,
-                                 start_cmd.as_deref(), then_send.as_deref(),
+                                 start_cmd.as_deref(), &cmd, then_send.as_deref(),
                                  probe_after, no_fin, debug)
         }
     };

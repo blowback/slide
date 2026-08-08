@@ -1,6 +1,10 @@
 ; ============================================================================
-; SLIDE v0.5.2 - Serial Line Inter-Device (file) Exchange
-; Custom file transfer protocol for Z80 / CP/M (wire protocol v0.2.1)
+; SLIDE v0.6.0-dev - Serial Line Inter-Device (file) Exchange
+; Custom file transfer protocol for Z80 / CP/M (wire protocol v0.3)
+;
+; v0.6.0-dev: wire v0.3 command channel (see docs/SPEC-v0.3.md). CTRL_ENQ
+; is answered in the receive-mode file loop; CMD_NOP / CMD_VOLS / CMD_DIR
+; reply with CANNED DATA — no BDOS enumeration is wired up yet.
 ; Target: 8MHz Z80, TL16C550 UART with 16-byte FIFO, auto RTS/CTS flow control
 ;
 ; Usage:  SLIDE              — receive mode (default)
@@ -51,6 +55,22 @@ CTRL_NAK        EQU	0x15             ; negative acknowledge
 CTRL_RDY        EQU	0x11             ; ready / handshake
 CTRL_FIN        EQU	0x04             ; end of session (renamed from CTRL_EOT)
 CTRL_CAN        EQU	0x18             ; cancel (disk error)
+CTRL_ENQ        EQU	0x05             ; v0.3 §2: a command frame follows
+
+; v0.3 §3 opcodes
+CMD_NOP         EQU	0x00             ; no-op; completes a probe-only exchange
+CMD_VOLS        EQU	0x01             ; list available volumes
+CMD_DIR         EQU	0x02             ; directory listing
+
+; How long to wait for the command frame after echoing ENQ. Shorter than
+; MAX_RETRIES: a client that echoes and then goes quiet is misbehaving, and
+; must not be able to park the server here for 30s.
+CMD_RETRIES     EQU	5                ; ~10s (5 x ~2s)
+
+; v0.3 §4 reply status codes
+ST_OK           EQU	0x00
+ST_OPCODE       EQU	0x01             ; unknown / unsupported opcode
+ST_OPERAND      EQU	0x02             ; missing or malformed operand
 
 WIN_SIZE        EQU	4                ; sliding window size
 FRAME_SIZE      EQU	1024             ; payload bytes per frame
@@ -352,6 +372,61 @@ uart_tx
                 RET
 
 tx_fail         DB	0
+
+; Read a byte if one arrives within ~1.3ms (256 polls at 8MHz).
+; Much shorter than uart_rx_timeout — used where we are chasing a byte
+; already known to be in flight, not waiting on the peer to decide.
+; Returns: carry clear + A = byte, carry set on timeout. Trashes A, B.
+uart_rx_brief
+                LD	B, 0
+.brief_loop
+                IN	A, (UART_LSR)
+                BIT	0, A
+                JR	NZ, .brief_got
+                DEC	B
+                JR	NZ, .brief_loop
+                SCF
+                RET
+.brief_got
+                IN	A, (UART_RBR)
+                OR	A                 ; clear carry
+                RET
+
+; ============================================================================
+; drain_stale_acks — clear leftover ACK/NAK pairs after a reply stream
+; without discarding a protocol byte that has already arrived.
+;
+; A blind uart_flush_rx here loses races. The client's FIN can reach the
+; FIFO between the terminator ACK and the flush, and is then swallowed:
+; the server sits in .file_loop forever and the session hangs with no
+; error anywhere. Measured at roughly 1 in 14 CMD_DIR runs.
+;
+; Returns: A = 0 if the line went quiet, otherwise the first byte that is
+;          not part of a stale ACK/NAK pair. The caller MUST dispatch on
+;          it — a UART byte cannot be un-read.
+; Trashes A, B.
+; ============================================================================
+drain_stale_acks
+.ds_loop
+                IN	A, (UART_LSR)
+                BIT	0, A
+                JR	Z, .ds_quiet    ; nothing pending — safe to leave
+                IN	A, (UART_RBR)
+                CP	CTRL_ACK
+                JR	Z, .ds_eat_seq
+                CP	CTRL_NAK
+                JR	Z, .ds_eat_seq
+                RET                     ; protocol byte — hand it back
+
+.ds_eat_seq
+                ; the sequence byte may still be on the wire (~520us at
+                ; 19200), so chase it rather than testing the FIFO once
+                CALL	uart_rx_brief
+                JR	.ds_loop
+
+.ds_quiet
+                XOR	A
+                RET
 
 ; Flush UART receive FIFO
 uart_flush_rx
@@ -881,10 +956,13 @@ recv_session
 .file_loop
                 CALL	uart_rx_timeout
                 JR	C, .file_loop   ; timeout — keep waiting
+.dispatch                               ; entry with a byte already in A
                 CP	CTRL_FIN
                 JR	Z, .got_fin
                 CP	CTRL_CAN
                 JR	Z, .got_can_session
+                CP	CTRL_ENQ
+                JR	Z, .got_enq
                 CP	SOF
                 JR	NZ, .file_loop  ; ignore stray bytes
 
@@ -926,6 +1004,18 @@ recv_session
 
                 JR	.file_loop
 
+.got_enq
+                ; v0.3 §2: a command frame follows. serve_command runs the
+                ; whole exchange and normally leaves us back here; it only
+                ; reports FIN or CAN if one arrived instead of a command.
+                CALL	serve_command
+                OR	A
+                JP	Z, .file_loop
+                ; Non-zero means serve_command handed back a byte it read but
+                ; must not discard — FIN, CAN, a following SOF, even another
+                ; ENQ. Dispatch it exactly as if the file loop had read it.
+                JP	.dispatch
+
 .got_fin
                 ; Print the session-complete message BEFORE echoing FIN.
                 ; PC closes the serial port the instant it sees our FIN echo
@@ -962,6 +1052,220 @@ recv_session
                 CALL	print_user_msg
                 CALL	send_can
                 RET
+
+; ============================================================================
+; serve_command — run one v0.3 §2 command exchange.
+;
+; Entry: CTRL_ENQ has just been consumed by the caller's file loop.
+; Exit:  A = 0        → handled; caller returns to its file loop
+;        A = CTRL_FIN → peer sent FIN instead of a command frame
+;        A = CTRL_CAN → peer cancelled (already echoed)
+;
+; Wire sequence (v0.3 §2, §4):
+;   <- ENQ                      (consumed by the caller)
+;   -> ENQ '0' '0' '0' '1'      capability echo + command-set version
+;   <- SOF + command frame, seq 0
+;   -> ACK 0
+;   -> status frame seq 1, record frame(s), zero-length terminator
+;   <- ACK
+;
+; NOTE: this build answers with canned data — no BDOS enumeration yet.
+; Replies are at most three frames, inside WIN_SIZE, so the client ACKs
+; only the terminator and no windowing is needed. A real CMD_DIR that
+; can exceed WIN_SIZE frames must consume mid-stream ACKs as send_file_tx
+; does.
+;
+; Deliberately silent: no print_user_msg during the exchange. Console
+; output in receive mode goes out this same UART, and would show up as
+; stray bytes in the client's reply stream.
+; ============================================================================
+serve_command
+                CALL	send_enq_echo
+
+                ; Wait for the command frame. CRC failures are retried here
+                ; rather than in the file loop: a retransmitted command frame
+                ; arriving there would be parsed as a file header.
+                LD	A, CMD_RETRIES
+                LD	(cmd_retry), A
+
+.wait_cmd
+                CALL	uart_rx_timeout
+                JR	C, .retry       ; timeout — count it and keep waiting
+                CP	CTRL_FIN
+                JR	Z, .got_fin
+                CP	CTRL_CAN
+                JR	Z, .got_can
+                CP	CTRL_ENQ
+                JR	Z, .dup_enq     ; client retried the probe (§2 idempotency)
+                CP	SOF
+                JR	NZ, .wait_cmd   ; stray byte — not worth a retry
+
+                LD	HL, RXBUF
+                CALL	recv_frame.after_sof
+                JR	NC, .got_cmd
+
+                ; bad frame — NAK seq 0 and let the client retransmit
+                XOR	A
+                CALL	send_nak
+
+.retry
+                LD	A, (cmd_retry)
+                DEC	A
+                LD	(cmd_retry), A
+                JR	NZ, .wait_cmd
+                XOR	A               ; gave up — back to the file loop
+                RET
+
+.dup_enq
+                CALL	send_enq_echo
+                JR	.retry
+
+.got_fin
+                LD	A, CTRL_FIN
+                RET
+
+.got_can
+                CALL	respond_to_cancel
+                LD	A, CTRL_CAN
+                RET
+
+.got_cmd
+                ; BC = payload length, RXBUF = payload. ACK the frame first
+                ; (§4), then decide what to answer with.
+                PUSH	BC
+                XOR	A
+                CALL	send_ack        ; ACK 0
+                POP	BC
+
+                LD	A, B
+                OR	C
+                JR	Z, .err_operand ; empty payload — no opcode in it
+
+                LD	A, (RXBUF)      ; opcode
+                CP	CMD_NOP
+                JR	Z, .do_nop
+                CP	CMD_VOLS
+                JR	Z, .do_vols
+                CP	CMD_DIR
+                JR	Z, .do_dir
+
+                LD	A, ST_OPCODE
+                JR	.status_only
+
+.do_nop
+                ; v0.3 §3: completes a probe-only exchange. The echo has
+                ; already told the client what it wanted to know; this just
+                ; releases the server from command mode without a listing.
+                LD	A, ST_OK
+                JR	.status_only
+
+.err_operand
+                LD	A, ST_OPERAND
+
+.status_only
+                ; error reply: status frame (seq 1) then terminator (§4)
+                LD	(cmd_status), A
+                LD	HL, cmd_status
+                LD	BC, 1
+                LD	A, 1
+                CALL	send_frame
+                LD	A, 2
+                JR	.terminate
+
+.do_vols
+                ; One frame carries the status byte and the single 5-byte
+                ; record together — §4 permits this when they fit.
+                LD	HL, vols_reply
+                LD	BC, VOLS_REPLY_LEN
+                LD	A, 1
+                CALL	send_frame
+                LD	A, 2
+                JR	.terminate
+
+.do_dir
+                ; Record count is not known up front in the real
+                ; implementation, so send the status frame alone and stream
+                ; records behind it (§4).
+                LD	A, ST_OK
+                LD	(cmd_status), A
+                LD	HL, cmd_status
+                LD	BC, 1
+                LD	A, 1
+                CALL	send_frame
+
+                LD	HL, dir_records
+                LD	BC, DIR_RECORDS_LEN
+                LD	A, 2
+                CALL	send_frame
+
+                LD	A, 3
+
+.terminate
+                ; zero-length frame ends the reply stream; A = its seq
+                LD	HL, 0
+                LD	BC, 0
+                CALL	send_frame
+
+                ; wait for the client's ACK of the terminator
+                CALL	recv_control_z80
+                JR	C, .done        ; no ACK — client gone; still clean up
+                CP	CTRL_CAN
+                JR	Z, .can_after
+
+.done
+                ; v0.3 §9: clear stale ACK/NAK pairs before returning to the
+                ; file loop — in receive mode this is the only place ACKs
+                ; can be left queued, and a leftover ACK's sequence byte
+                ; would read as SOF or FIN there.
+                ;
+                ; Selective, NOT a blind flush: uart_flush_rx here ate the
+                ; client's FIN when it landed between the terminator ACK and
+                ; the drain, hanging the session about 1 run in 14. Anything
+                ; drain_stale_acks could not legitimately eat comes back in A
+                ; and the caller dispatches on it.
+                CALL	drain_stale_acks
+                RET
+
+.can_after
+                CALL	uart_flush_rx
+                LD	A, CTRL_CAN
+                RET
+
+; ----------------------------------------------------------------------------
+; send_enq_echo — v0.3 §2 capability echo: CTRL_ENQ then the 4-byte VER.
+; Unconditional and stateless. Trashes A, B, HL.
+; ----------------------------------------------------------------------------
+send_enq_echo
+                LD	A, CTRL_ENQ
+                CALL	uart_tx
+                LD	HL, cmdset_ver
+                LD	B, 4
+.ve_loop
+                LD	A, (HL)
+                CALL	uart_tx
+                INC	HL
+                DJNZ	.ve_loop
+                RET
+
+cmdset_ver      DB	'0', '0', '0', '1'  ; v0.3 §2 VER: major 00, minor 01
+cmd_status      DB	0
+cmd_retry       DB	0
+
+; --- canned CMD_VOLS reply (v0.3 §5) ----------------------------------------
+; [ST_OK][present_lo][present_hi][logged_lo][logged_hi][current]
+vols_reply      DB	ST_OK
+                DB	0x03, 0x00      ; present = A: and B:
+                DB	0x01, 0x00      ; logged  = A:
+                DB	0x00            ; current drive = A:
+VOLS_REPLY_LEN  EQU	$ - vols_reply
+
+; --- canned CMD_DIR records (v0.3 §5) ---------------------------------------
+; 16 bytes each: [user][11-byte name][attr][3-byte size in 128-byte records]
+dir_records
+                DB	0, "SLIDE   COM", 0x00, 0x17, 0x00, 0x00
+                DB	0, "TEST    TXT", 0x00, 0x08, 0x00, 0x00
+                DB	0, "README  DOC", 0x01, 0x04, 0x00, 0x00
+DIR_RECORDS_LEN EQU	$ - dir_records
 
 ; ============================================================================
 ; Main file receive loop (single file, called by recv_session)
@@ -1960,8 +2264,8 @@ print_user_msg
 ; ============================================================================
 ; Messages
 ; ============================================================================
-msg_banner_recv DB	"SLIDE v0.5.2 - Receive mode", 13, 10, '$'
-msg_banner_send DB	"SLIDE v0.5.2 - Send mode", 13, 10, '$'
+msg_banner_recv DB	"SLIDE v0.6.0-dev - Receive mode", 13, 10, '$'
+msg_banner_send DB	"SLIDE v0.6.0-dev - Send mode", 13, 10, '$'
 msg_sending     DB	"Sending: ", '$'
 msg_done        DB	13, 10, "Transfer complete!", 13, 10, '$'
 msg_done_session DB	13, 10, "Session complete.", 13, 10, '$'

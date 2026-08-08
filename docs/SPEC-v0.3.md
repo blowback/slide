@@ -113,6 +113,27 @@ Because `CTRL_ENQ` precedes every command frame, `VER` is repeated on
 every command. At five bytes per exchange that is not worth optimising
 away, and a constant, unconditional reply keeps the server stateless.
 
+### An echo obliges the client to send a command frame
+
+Once the server has echoed, it is waiting for a command frame, and the
+next `SOF` it sees will be read as one. A client that echoes and then
+sends a file header instead would have that header parsed as a command:
+the file is never received and the client gets a nonsense status back.
+
+So: **after receiving the echo, a client MUST send exactly one command
+frame.** A client that only wanted to know whether the peer speaks
+commands has already learned it, and MUST send `CMD_NOP` (§3) to
+complete the exchange before doing anything else.
+
+`CTRL_FIN` and `CTRL_CAN` remain valid in this state and end the session
+or cancel as usual — a client may always abandon rather than complete.
+What it may not do is send a frame that is not a command frame.
+
+Servers MUST NOT wait indefinitely here. A client that echoes and then
+goes quiet is misbehaving, and the server should return to its file loop
+after a bounded wait rather than parking the session. The reference
+firmware allows ~10 s.
+
 ### Where the client may send it
 
 Only where the server is parked in a raw-byte wait loop with no frame in
@@ -177,11 +198,17 @@ A command frame is an ordinary v0.2.1 frame:
 
 | Value | Name       | Operands                         |
 |-------|------------|----------------------------------|
-| 0x00  | —          | reserved, invalid                |
+| 0x00  | CMD_NOP    | none — completes a probe-only exchange |
 | 0x01  | CMD_VOLS   | none                             |
 | 0x02  | CMD_DIR    | drive, user, [match pattern]     |
 | 0x03–0x7F | —      | reserved for future amendments   |
 | 0x80–0xFF | —      | private / vendor use             |
+
+`CMD_NOP` exists because of the rule in §2: an echoed `CTRL_ENQ` obliges
+the client to send a command frame. A client that only wanted to know
+whether the peer speaks commands has already learned it from the echo,
+and sends `CMD_NOP` to complete the exchange. The server answers
+`ST_OK` with no records.
 
 Opcodes live inside a CRC-protected payload sent only to a confirmed
 v0.3 peer, so they are unconstrained by the control-byte allocation.
@@ -414,15 +441,49 @@ v0.5.2 on MicroBeast hardware at 19200 baud on 2026-08-07 and
   with nothing transferred exits cleanly.
 - **Probing after a completed file transfer behaves identically.** A
   second probe issued once the transfer's EOF frame had been ACKed drew
-  the same silence, and the wire was measurably idle going in — nothing
-  was queued ahead of it. In receive mode the preceding transfer's ACKs
-  flow *from* the server, so this confirms the client had consumed them
-  all and that the position is as clean as the post-handshake one.
+  the same silence.
+
+  What *is* queued at that position is not what was expected. The
+  concern was leftover ACKs — in receive mode they flow *from* the
+  server, so any the client failed to read would land here. None
+  appeared: the ACK accounting balances exactly, including at a frame
+  count that is an exact multiple of `WIN_SIZE`, where the window ACK
+  and the EOF ACK are separate messages.
+
+  Instead the wire carries 22 bytes of console text —
+  `\r\nTransfer complete!\r\n`, the per-file status message that
+  `print_user_msg` routes to the UART so remote operators can see it.
+  It is inert: every byte is printable ASCII, `CR` or `LF`, so none can
+  be mistaken for a control byte or an `SOF`. See "Status text on the
+  wire" in §9.
 - **The v0.2.1 §1 wakeup signature arrives intact** when the client
   starts the session itself (see below).
 
 That covers every probe position §2 permits except "after a completed
 command exchange", which cannot be tested until a v0.3 server exists.
+
+### Verification status — v0.3 ↔ v0.3
+
+The `v0.3 client → v0.3 server` row is also measured, against `slide.com`
+v0.6.0-dev (canned data, no BDOS enumeration yet) on both a MicroBeast and
+a NanoBeast:
+
+- **The capability exchange works.** `CTRL_ENQ` draws an echo plus VER
+  `0001` on the first attempt, parsed as major 0 / minor 1.
+- **`CMD_VOLS` round-trips.** `ST_OK`, one 5-byte record, decoded to the
+  expected drive bitmaps and current drive.
+- **`CMD_DIR` round-trips.** `ST_OK`, a 1-byte status frame, a 48-byte
+  record frame and a zero-length terminator; all three records decoded.
+- **The reply stream is stable.** 40 consecutive `CMD_DIR` exchanges with
+  no failure (`slide-py/soak_dir.py`), after the selective-drain fix in §9.
+  Before that fix the same harness failed 1 run in 14.
+
+The intermittent failure that fix addresses is worth remembering as a
+class: a correct-looking reply followed by a silently hung session, where
+every frame on the wire was well formed and the loss happened *after* the
+exchange completed. Single-run testing showed it as "works", and the
+`--debug` output of a passing run looks identical to a failing one. Only
+repetition surfaced it.
 
 Two limits on how far to read the residue result. It was measured on a
 clean transfer with no NAK and no retransmission, so it says nothing
@@ -484,16 +545,37 @@ mode-entry confirmation — just never as a capability or version check.
   command tail lives there and is no longer needed by then, but
   `create_file` and friends assume the standard DMA setup.
 
+#### Status text on the wire
+
+`print_user_msg` sends user-facing status to the UART, because for a
+remotely driven session that is the operator's only console. So a client
+will find human-readable text on the wire at protocol-quiescent points —
+measurably, 22 bytes of `\r\nTransfer complete!\r\n` sitting in the
+buffer after each file's EOF ACK.
+
+This is safe only because every byte of every message is printable
+ASCII, `CR` or `LF`. **Status messages MUST NOT contain any byte that
+could be read as a control byte or `SOF`** — `0x01`, `0x04`, `0x05`,
+`0x06`, `0x11`, `0x15`, `0x18`. Escape sequences and box-drawing
+characters are the obvious way to break this by accident; `ESC` (`0x1B`)
+is not itself a control byte here but leads the wakeup signature, so
+avoid it too.
+
+Clients SHOULD surface this text to the operator rather than discarding
+it. A client that drains before probing (as §2 recommends) will collect
+it, and it is exactly the information the operator wanted to see.
+
 #### Draining after a reply stream (required)
 
-A server MUST `CALL uart_flush_rx` when a command reply completes, before
-returning to the file loop.
+A server MUST clear stale `CTRL_ACK` / `CTRL_NAK` pairs when a command
+reply completes, before returning to the file loop — and MUST do it
+**selectively**. A blind input-buffer flush here is wrong; see below.
 
-This closes a hazard the command channel creates. In v0.2.1 receive mode
-the Z80 never sends frames, so it never consumes ACKs, so no ACK can ever
-be sitting unread when `.file_loop` next reads a byte. A reply stream
-changes that: if the exchange hit a NAK or a retransmit, the client may
-have queued more ACKs than the server's send loop consumed.
+The hazard being closed is one the command channel creates. In v0.2.1
+receive mode the Z80 never sends frames, so it never consumes ACKs, so no
+ACK can be sitting unread when `.file_loop` next reads a byte. A reply
+stream changes that: if the exchange hit a NAK or a retransmit, the
+client may have queued more ACKs than the server's send loop consumed.
 
 The leftovers are not harmless. `.file_loop` skips a stray `CTRL_ACK`
 (`0x06`) because it matches none of its tests — and then reads the
@@ -504,10 +586,54 @@ A queued `ACK 4` reads as `FIN` and ends the session early. Neither
 failure is detectable by CRC, because the frame the server thinks it is
 reading never existed.
 
-One flush call removes the whole class. The same argument applies to the
-existing send path, where it is noted as optional hardening
-(`docs/IDEAS.md`); here it is required, because the reply stream is what
-puts ACKs in flight during receive mode in the first place.
+##### Why a blind flush is wrong
+
+This section previously required `CALL uart_flush_rx`. That is a defect,
+found on hardware and recorded here so nobody reintroduces it.
+
+The client sends the terminator ACK and then, with nothing to do in
+between, its next protocol byte. Those two writes can reach the server
+close enough together that the second is already in the receive FIFO when
+the drain runs — so the flush eats it. When the swallowed byte is
+`CTRL_FIN`, the server returns to `.file_loop` and waits there forever:
+`.file_loop` has no retry budget, so the session hangs with no error
+reported on either side, and the board needs a power cycle.
+
+Measured with `slide-py/soak_dir.py` against `slide.com` v0.6.0-dev:
+**one failure in 14 `CMD_DIR` runs**. The diagnostic that settles it is to
+send a second `CTRL_FIN` after the failure — it is echoed immediately,
+proving the server was alive in its file loop and the first FIN was
+discarded rather than missed.
+
+The race widens as the client gets faster: a client that prints its
+results between the ACK and the FIN is less exposed than one writing to
+`/dev/null`. That makes it exactly the kind of defect that survives
+casual testing and reappears in production.
+
+##### What to do instead
+
+Drain in a loop that inspects each byte:
+
+- `CTRL_ACK` / `CTRL_NAK` — stale, discard, and also consume the sequence
+  byte that follows. That byte may still be on the wire (~520 µs at
+  19200), so chase it with a short bounded wait rather than testing the
+  FIFO once.
+- Anything else — stop. Do **not** discard it.
+- Nothing pending — stop.
+
+A UART byte cannot be un-read, so a drain that stops on a protocol byte is
+already holding it. It MUST return that byte to the caller, and the caller
+MUST dispatch on it exactly as the file loop would have. `FIN`, `CAN`, a
+following `SOF` and a further `ENQ` are all legal at that point.
+
+The reference implementation is `drain_stale_acks` in `slide.asm`, which
+returns the byte in `A` (or 0 if the line went quiet); `serve_command`
+hands it up and the file loop's `.dispatch` entry point processes it as
+though it had read it itself.
+
+The same argument applies to the existing send path, where a flush is
+noted as optional hardening (`docs/IDEAS.md`). If it is ever added there,
+it must be selective for the same reason.
 
 ### PC (`slide-py`, `slide-rs`)
 

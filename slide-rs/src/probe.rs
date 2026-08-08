@@ -39,6 +39,79 @@ fn outcome_name(outcome: &ProbeOutcome) -> &'static str {
     }
 }
 
+/// Render a drive bitmap as CP/M drive letters.
+fn drive_list(map: u16) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for n in 0..16u32 {
+        if map & (1 << n) != 0 {
+            out.push(format!("{}:", (b'A' + n as u8) as char));
+        }
+    }
+    if out.is_empty() {
+        "(none)".to_string()
+    } else {
+        out.join(" ")
+    }
+}
+
+/// Pretty-print a CMD_VOLS reply: one 5-byte record (v0.3 §5).
+fn show_vols(records: &[u8]) {
+    if records.len() < 5 {
+        println!("  Malformed: expected a 5-byte record, got {}", records.len());
+        println!("  Raw: {}", hex(records));
+        return;
+    }
+    let present = u16::from(records[0]) | (u16::from(records[1]) << 8);
+    let logged = u16::from(records[2]) | (u16::from(records[3]) << 8);
+    println!("  Present: {}", drive_list(present));
+    println!("  Logged:  {}", drive_list(logged));
+    println!(
+        "  Current: {}:",
+        (b'A' + records[4].min(15)) as char
+    );
+}
+
+/// Pretty-print a CMD_DIR reply: 16-byte records (v0.3 §5).
+fn show_dir(records: &[u8]) {
+    if records.len() % 16 != 0 {
+        println!(
+            "  Malformed: {} bytes is not a whole number of 16-byte records",
+            records.len()
+        );
+        println!("  Raw: {}", hex(records));
+        return;
+    }
+    if records.is_empty() {
+        println!("  (empty directory)");
+        return;
+    }
+    println!("  {:<4} {:<12} {:<5} {:>10}", "USER", "NAME", "ATTR", "BYTES");
+    for r in records.chunks(16) {
+        let name = String::from_utf8_lossy(&r[1..9]);
+        let ext = String::from_utf8_lossy(&r[9..12]);
+        let mut attr = String::new();
+        if r[12] & 0x01 != 0 {
+            attr.push_str("R/O ");
+        }
+        if r[12] & 0x02 != 0 {
+            attr.push_str("SYS ");
+        }
+        if r[12] & 0x04 != 0 {
+            attr.push_str("ARC ");
+        }
+        // Size is in 128-byte records — an upper bound in bytes, as for the
+        // file-transfer header's size field.
+        let recs = u32::from(r[13]) | (u32::from(r[14]) << 8) | (u32::from(r[15]) << 16);
+        println!(
+            "  {:<4} {:<12} {:<5} {:>10}",
+            r[0],
+            format!("{}.{}", name.trim_end(), ext.trim_end()),
+            attr.trim_end(),
+            recs * 128
+        );
+    }
+}
+
 /// Print the probe verdict and the raw evidence behind it.
 fn report(result: &ProbeResult, label: &str) {
     println!();
@@ -97,6 +170,50 @@ fn report(result: &ProbeResult, label: &str) {
     println!();
 }
 
+
+/// v0.3 §2: an echo obliges the client to send exactly one command frame.
+/// Even when we only wanted to probe, the server is in command mode and
+/// would read a file header as a command — so complete the exchange with
+/// CMD_NOP. Returns false if the command itself failed.
+fn honour_enq_obligation(
+    port: &mut dyn serialport::SerialPort,
+    result: &ProbeResult,
+    cmd: &str,
+    debug: bool,
+) -> Result<bool> {
+    if !result.usable() {
+        return Ok(true);
+    }
+    let (opcode, operands, label) = match cmd {
+        "vols" => (CMD_VOLS, vec![], "CMD_VOLS"),
+        // drive 0xFF = current, user 0xFF = current (§5)
+        "dir" => (CMD_DIR, vec![0xFFu8, 0xFF], "CMD_DIR"),
+        _ => (CMD_NOP, vec![], "CMD_NOP"),
+    };
+    println!("{}", style(format!("--- {label} ---")).bold());
+    match send_command(port, opcode, &operands, debug) {
+        Ok(reply) => {
+            println!("  Status: 0x{:02X} — {}", reply.status, status_name(reply.status));
+            if reply.status == 0 {
+                match opcode {
+                    CMD_VOLS => show_vols(&reply.records),
+                    CMD_DIR => show_dir(&reply.records),
+                    _ => println!("  (no records — probe-only exchange completed)"),
+                }
+            } else if !reply.records.is_empty() {
+                println!("  Unexpected records with a non-OK status: {}", hex(&reply.records));
+            }
+            println!();
+            Ok(true)
+        }
+        Err(e) => {
+            println!("  Command FAILED: {e:#}");
+            println!();
+            Ok(false)
+        }
+    }
+}
+
 /// Handshake, probe, optionally transfer a file, then close the session.
 #[allow(clippy::too_many_arguments)]
 pub fn probe_session(
@@ -106,6 +223,7 @@ pub fn probe_session(
     echo_timeout_ms: u64,
     settle_ms: u64,
     start_cmd: Option<&str>,
+    cmd: &str,
     then_send: Option<&str>,
     probe_after: bool,
     skip_fin: bool,
@@ -162,8 +280,11 @@ pub fn probe_session(
         bail!("Peer cancelled during the probe");
     }
 
-    // --- Prove the session survived the probe ---
+    // v0.3 §2: an echo obliges us to send exactly one command frame.
     let mut session_ok = true;
+    if !honour_enq_obligation(port.as_mut(), &result, cmd, debug)? {
+        session_ok = false;
+    }
 
     if let Some(filename) = then_send {
         println!(
@@ -213,6 +334,9 @@ pub fn probe_session(
                 style("NOTE:").yellow().bold()
             );
         }
+        if !honour_enq_obligation(port.as_mut(), &after, "nop", debug)? {
+            session_ok = false;
+        }
         if !after.discarded.is_empty() {
             println!(
                 "  {} {} byte(s) were still queued from the transfer.",
@@ -231,7 +355,9 @@ pub fn probe_session(
     port.write_all(&[CTRL_FIN])?;
     port.flush()?;
 
-    match recv_control(port.as_mut(), Duration::from_secs(5)) {
+    // 10s, not 5: the receiver closes the file (a directory write) after
+    // acknowledging EOF and before returning to its file loop.
+    match recv_control(port.as_mut(), Duration::from_secs(10)) {
         Ok(Control::Fin) => {
             println!("  FIN echoed. The peer was still in its file loop and exited");
             println!("  cleanly — the probe did not disturb the session.");
@@ -245,7 +371,7 @@ pub fn probe_session(
             session_ok = false;
         }
         Err(_) => {
-            println!("  No FIN echo within 5s. The probe may have disturbed the peer —");
+            println!("  No FIN echo within 10s. The probe may have disturbed the peer —");
             println!("  worth investigating before trusting the compatibility claim.");
             session_ok = false;
         }

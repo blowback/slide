@@ -25,11 +25,55 @@ from slide.common import (
     ProbeOutcome,
     open_serial, handshake_as_sender, send_start_command,
     probe_command_support, recv_control,
+    CMD_NOP, CMD_VOLS, CMD_DIR, send_command, status_name,
 )
 
 
 def _hex(b: bytes) -> str:
     return b.hex(' ') if b else '(none)'
+
+
+def _drive_list(bitmap: int) -> str:
+    """Render a drive bitmap as CP/M drive letters."""
+    drives = [f"{chr(ord('A') + n)}:" for n in range(16) if bitmap & (1 << n)]
+    return ' '.join(drives) if drives else '(none)'
+
+
+def show_vols(records: bytes) -> None:
+    """Pretty-print a CMD_VOLS reply: one 5-byte record (v0.3 §5)."""
+    if len(records) < 5:
+        print(f"  Malformed: expected a 5-byte record, got {len(records)}")
+        print(f"  Raw: {_hex(records)}")
+        return
+    present = records[0] | (records[1] << 8)
+    logged = records[2] | (records[3] << 8)
+    print(f"  Present: {_drive_list(present)}")
+    print(f"  Logged:  {_drive_list(logged)}")
+    print(f"  Current: {chr(ord('A') + min(records[4], 15))}:")
+
+
+def show_dir(records: bytes) -> None:
+    """Pretty-print a CMD_DIR reply: 16-byte records (v0.3 §5)."""
+    if len(records) % 16:
+        print(f"  Malformed: {len(records)} bytes is not a whole number of "
+              f"16-byte records")
+        print(f"  Raw: {_hex(records)}")
+        return
+    if not records:
+        print("  (empty directory)")
+        return
+    print(f"  {'USER':<4} {'NAME':<12} {'ATTR':<5} {'BYTES':>10}")
+    for i in range(0, len(records), 16):
+        r = records[i:i + 16]
+        name = r[1:9].decode('ascii', 'replace').rstrip()
+        ext = r[9:12].decode('ascii', 'replace').rstrip()
+        attr = ''.join(f for bit, f in ((0x01, 'R/O '), (0x02, 'SYS '),
+                                        (0x04, 'ARC ')) if r[12] & bit)
+        # Size is in 128-byte records — an upper bound in bytes, as for the
+        # file-transfer header's size field.
+        recs = r[13] | (r[14] << 8) | (r[15] << 16)
+        print(f"  {r[0]:<4} {name + '.' + ext:<12} {attr.rstrip():<5} "
+              f"{recs * 128:>10}")
 
 
 def report(result, label: str) -> None:
@@ -83,9 +127,47 @@ def report(result, label: str) -> None:
     print()
 
 
+def _honour_enq_obligation(ser, result, cmd: str, debug: bool) -> bool:
+    """
+    v0.3 §2: an echo obliges the client to send exactly one command frame.
+    Even when we only wanted to probe, the server is in command mode and
+    would read a file header as a command — so complete the exchange with
+    CMD_NOP. Returns False if the command itself failed.
+    """
+    if not result.usable:
+        return True
+
+    opcode, operands, label = {
+        # drive 0xFF = current, user 0xFF = current (§5)
+        'vols': (CMD_VOLS, b'', 'CMD_VOLS'),
+        'dir': (CMD_DIR, bytes([0xFF, 0xFF]), 'CMD_DIR'),
+    }.get(cmd, (CMD_NOP, b'', 'CMD_NOP'))
+
+    print(f"--- {label} ---")
+    try:
+        reply = send_command(ser, opcode, operands, debug)
+        print(f"  Status: 0x{reply.status:02X} — {status_name(reply.status)}")
+        if reply.status == 0:
+            if opcode == CMD_VOLS:
+                show_vols(reply.records)
+            elif opcode == CMD_DIR:
+                show_dir(reply.records)
+            else:
+                print("  (no records — probe-only exchange completed)")
+        elif reply.records:
+            print(f"  Unexpected records with a non-OK status: {_hex(reply.records)}")
+        print()
+        return True
+    except Exception as e:
+        print(f"  Command FAILED: {e}")
+        print()
+        return False
+
+
 def probe_session(port: str, baud: int = 19200, attempts: int = 3,
                   echo_timeout: float = 0.5, settle: float = 0.1,
-                  start_cmd: str = None, then_send: str = None,
+                  start_cmd: str = None, cmd: str = 'nop',
+                  then_send: str = None,
                   probe_after: bool = False, skip_fin: bool = False,
                   debug: bool = False) -> int:
     """Handshake, probe, optionally transfer a file, then close the session."""
@@ -122,8 +204,8 @@ def probe_session(port: str, baud: int = 19200, attempts: int = 3,
         ser.close()
         return 1
 
-    # --- Prove the session survived the probe ---
-    session_ok = True
+    # v0.3 §2: an echo obliges us to send exactly one command frame.
+    session_ok = _honour_enq_obligation(ser, result, cmd, debug)
 
     if then_send:
         print(f"--- Sending {then_send} to confirm the session still works ---")
@@ -150,6 +232,8 @@ def probe_session(port: str, baud: int = 19200, attempts: int = 3,
             return 1
         if after.outcome is not result.outcome:
             print("  NOTE: post-transfer outcome differs from the post-handshake one.")
+        if not _honour_enq_obligation(ser, after, 'nop', debug):
+            session_ok = False
         if after.discarded:
             print(f"  NOTE: {len(after.discarded)} byte(s) were still queued "
                   f"from the transfer.")
@@ -163,8 +247,10 @@ def probe_session(port: str, baud: int = 19200, attempts: int = 3,
     print("--- FIN exchange (session-intact check) ---")
     ser.write(bytes([CTRL_FIN]))
     ser.flush()
+    # 10s, not 5: the receiver closes the file (a directory write) after
+    # acknowledging EOF and before returning to its file loop.
     try:
-        ctrl, _ = recv_control(ser, timeout=5.0)
+        ctrl, _ = recv_control(ser, timeout=10.0)
     except TimeoutError:
         ctrl = None
 
@@ -175,7 +261,7 @@ def probe_session(port: str, baud: int = 19200, attempts: int = 3,
         print("  Peer cancelled instead of echoing FIN.")
         session_ok = False
     elif ctrl is None:
-        print("  No FIN echo within 5s. The probe may have disturbed the peer —")
+        print("  No FIN echo within 10s. The probe may have disturbed the peer —")
         print("  worth investigating before trusting the compatibility claim.")
         session_ok = False
     else:
@@ -210,6 +296,9 @@ def main():
                         help="Type this at the peer's CP/M prompt to start it, "
                              "instead of requiring a separate terminal "
                              "(e.g. 'slide r' or 'b:slide r')")
+    parser.add_argument('--cmd', default='nop', choices=['nop', 'vols', 'dir'],
+                        help='Command to issue if the peer supports them '
+                             '(default: nop)')
     parser.add_argument('--then-send', metavar='FILE',
                         help='After probing, send FILE to prove the session still works')
     parser.add_argument('--probe-after', action='store_true',
@@ -226,8 +315,9 @@ def main():
         sys.exit(1)
 
     sys.exit(probe_session(args.port, args.baud, args.attempts, args.timeout,
-                           args.settle, args.start_cmd, args.then_send,
-                           args.probe_after, args.no_fin, args.debug))
+                           args.settle, args.start_cmd, args.cmd,
+                           args.then_send, args.probe_after, args.no_fin,
+                           args.debug))
 
 
 if __name__ == '__main__':

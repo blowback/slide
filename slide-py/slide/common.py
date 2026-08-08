@@ -399,3 +399,89 @@ def _read_version(ser: serial.Serial, timeout: float, stray: bytearray,
         discarded=discarded,
         attempts=attempt,
     )
+
+
+# ============================================================================
+# v0.3 §3/§4 — command frames and reply streams
+# ============================================================================
+
+CMD_NOP  = 0x00   # no-op; completes a probe-only exchange
+CMD_VOLS = 0x01
+CMD_DIR  = 0x02
+
+_STATUS_NAMES = {
+    0x00: "ST_OK",
+    0x01: "ST_OPCODE — unknown or unsupported opcode",
+    0x02: "ST_OPERAND — missing or malformed operand",
+    0x03: "ST_NODRIVE — drive not present or not selectable",
+    0x04: "ST_IO — BDOS/BIOS error during enumeration",
+    0x05: "ST_BUSY — server cannot service the request now",
+}
+
+
+def status_name(status: int) -> str:
+    """Human-readable name for a v0.3 §4 status code."""
+    return _STATUS_NAMES.get(status, "unknown status")
+
+
+@dataclass
+class CommandReply:
+    status: int
+    records: bytes = b''
+
+
+def send_command(ser: serial.Serial, opcode: int, operands: bytes = b'',
+                 debug: bool = False) -> CommandReply:
+    """
+    Send a v0.3 §3 command frame and read the §4 reply stream.
+
+    The caller MUST already have had a CTRL_ENQ echoed (§2) — the server is
+    in command mode and this frame is what it is waiting for. Sending a
+    command frame without that echo is forbidden by §6.
+    """
+    from slide.recv import recv_frame, send_control, _FinReceived
+
+    payload = bytes([opcode]) + operands
+    frame = build_frame(0, payload)
+    if debug:
+        print(f"    DEBUG command frame: {frame.hex(' ')}")
+    ser.write(frame)
+    ser.flush()
+
+    # §4: the server ACKs the command frame before replying.
+    ctrl, seq = recv_control(ser, timeout=5.0)
+    if ctrl == CTRL_NAK:
+        raise ValueError(f"server NAKed the command frame (seq {seq})")
+    if ctrl == CTRL_CAN:
+        raise CanReceived("server cancelled instead of accepting the command")
+    if ctrl != CTRL_ACK or seq != 0:
+        raise ValueError(f"expected ACK 0 for the command frame, got 0x{ctrl:02X} seq={seq}")
+
+    # §4: status frame (seq 1), record frames, zero-length terminator.
+    body = bytearray()
+    expected_seq = 1
+    while True:
+        try:
+            seq, chunk = recv_frame(ser, timeout=10.0)
+        except _FinReceived:
+            raise ValueError("unexpected FIN during the reply stream")
+
+        if not chunk:
+            if debug:
+                print(f"    DEBUG reply terminator seq={seq}")
+            send_control(ser, CTRL_ACK, seq)
+            break
+        if seq != expected_seq:
+            send_control(ser, CTRL_NAK, expected_seq)
+            continue
+        if debug:
+            print(f"    DEBUG reply frame seq={seq} len={len(chunk)}")
+        body.extend(chunk)
+        expected_seq = (expected_seq + 1) & 0xFF
+        # ACK every WIN_SIZE frames, as for file data.
+        if (expected_seq - 1) & (WIN_SIZE - 1) == 0:
+            send_control(ser, CTRL_ACK, seq)
+
+    if not body:
+        raise ValueError("reply stream ended without a status frame")
+    return CommandReply(status=body[0], records=bytes(body[1:]))

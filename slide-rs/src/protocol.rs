@@ -568,6 +568,108 @@ fn read_version(
     Ok(ProbeOutcome::Supported { major, minor, ver_raw: ver })
 }
 
+// ============================================================================
+// v0.3 §3/§4 — command frames and reply streams
+// ============================================================================
+
+/// v0.3 §3 opcodes.
+pub const CMD_NOP: u8 = 0x00;
+pub const CMD_VOLS: u8 = 0x01;
+pub const CMD_DIR: u8 = 0x02;
+
+/// A decoded v0.3 §4 reply stream.
+pub struct CommandReply {
+    /// Status byte from the first reply frame.
+    pub status: u8,
+    /// Everything after the status byte, records concatenated.
+    pub records: Vec<u8>,
+}
+
+/// Human-readable name for a v0.3 §4 status code.
+pub fn status_name(status: u8) -> &'static str {
+    match status {
+        0x00 => "ST_OK",
+        0x01 => "ST_OPCODE — unknown or unsupported opcode",
+        0x02 => "ST_OPERAND — missing or malformed operand",
+        0x03 => "ST_NODRIVE — drive not present or not selectable",
+        0x04 => "ST_IO — BDOS/BIOS error during enumeration",
+        0x05 => "ST_BUSY — server cannot service the request now",
+        _ => "unknown status",
+    }
+}
+
+/// Send a v0.3 §3 command frame and read the §4 reply stream.
+///
+/// The caller MUST already have had a `CTRL_ENQ` echoed (§2) — the server
+/// is in command mode and this frame is what it is waiting for. Sending a
+/// command frame without that echo is forbidden by §6.
+pub fn send_command(
+    port: &mut dyn serialport::SerialPort,
+    opcode: u8,
+    operands: &[u8],
+    debug: bool,
+) -> Result<CommandReply> {
+    // §3: command frame is seq 0, payload[0] = opcode.
+    let mut payload = vec![opcode];
+    payload.extend_from_slice(operands);
+    let frame = build_frame(0, &payload);
+    if debug {
+        eprintln!("    DEBUG command frame: {}", hex_bytes(&frame));
+    }
+    port.write_all(&frame)?;
+    port.flush()?;
+
+    // §4: the server ACKs the command frame before replying.
+    match recv_control(port, Duration::from_secs(5))? {
+        Control::Ack(0) => {}
+        Control::Ack(s) => bail!("expected ACK 0 for the command frame, got ACK {s}"),
+        Control::Nak(s) => bail!("server NAKed the command frame (seq {s})"),
+        Control::Can => bail!("server cancelled instead of accepting the command"),
+        other => bail!("expected ACK 0 for the command frame, got {other:?}"),
+    }
+
+    // §4: status frame (seq 1), record frames, zero-length terminator.
+    let mut body: Vec<u8> = Vec::new();
+    let mut expected_seq: u8 = 1;
+    loop {
+        match recv_frame(port, Duration::from_secs(10))? {
+            FrameResult::Data(f) => {
+                if f.payload.is_empty() {
+                    if debug {
+                        eprintln!("    DEBUG reply terminator seq={}", f.seq);
+                    }
+                    send_control(port, CTRL_ACK, Some(f.seq))?;
+                    break;
+                }
+                if f.seq != expected_seq {
+                    send_control(port, CTRL_NAK, Some(expected_seq))?;
+                    continue;
+                }
+                if debug {
+                    eprintln!(
+                        "    DEBUG reply frame seq={} len={}",
+                        f.seq,
+                        f.payload.len()
+                    );
+                }
+                body.extend_from_slice(&f.payload);
+                expected_seq = expected_seq.wrapping_add(1);
+                // ACK every WIN_SIZE frames, as for file data.
+                if expected_seq.wrapping_sub(1) % (WIN_SIZE as u8) == 0 {
+                    send_control(port, CTRL_ACK, Some(f.seq))?;
+                }
+            }
+            FrameResult::Fin => bail!("unexpected FIN during the reply stream"),
+            FrameResult::Cancel => bail!("server cancelled during the reply stream"),
+        }
+    }
+
+    let Some((&status, records)) = body.split_first() else {
+        bail!("reply stream ended without a status frame");
+    };
+    Ok(CommandReply { status, records: records.to_vec() })
+}
+
 /// Parse a v0.3 §2 VER field: four ASCII digits, 'MMmm'. Returns
 /// (major, minor), or None if the field is the wrong length or not all
 /// digits — which §2 says to treat as no command support, not as a guess.
