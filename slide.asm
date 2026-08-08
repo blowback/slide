@@ -4,7 +4,7 @@
 ;
 ; v0.6.0-dev: wire v0.3 command channel (see docs/SPEC-v0.3.md). CTRL_ENQ
 ; is answered in the receive-mode file loop; CMD_NOP / CMD_VOLS / CMD_DIR
-; reply with CANNED DATA — no BDOS enumeration is wired up yet.
+; are served from real BDOS/BIOS enumeration.
 ; Target: 8MHz Z80, TL16C550 UART with 16-byte FIFO, auto RTS/CTS flow control
 ;
 ; Usage:  SLIDE              — receive mode (default)
@@ -71,6 +71,9 @@ CMD_RETRIES     EQU	5                ; ~10s (5 x ~2s)
 ST_OK           EQU	0x00
 ST_OPCODE       EQU	0x01             ; unknown / unsupported opcode
 ST_OPERAND      EQU	0x02             ; missing or malformed operand
+ST_NODRIVE      EQU	0x03             ; drive not present or not selectable
+ST_IO           EQU	0x04             ; BDOS/BIOS error during enumeration
+ST_BUSY         EQU	0x05             ; cannot service the request now
 
 WIN_SIZE        EQU	4                ; sliding window size
 FRAME_SIZE      EQU	1024             ; payload bytes per frame
@@ -91,6 +94,22 @@ F_WRITE         EQU	21
 F_CREATE        EQU	22
 F_SETDMA        EQU	26
 F_FSIZE         EQU	35               ; compute file size (sets random record field)
+F_SFIRST        EQU	17               ; search for first directory match
+F_SNEXT         EQU	18               ; search for next
+DRV_SET         EQU	14               ; select disk
+DRV_LOGINVEC    EQU	24               ; return login vector
+DRV_GET         EQU	25               ; return current disk
+F_USERNUM       EQU	32               ; get/set user number
+
+; BIOS jump table. 0x0001 holds the address of the WBOOT entry, which is
+; BIOS base + 3; SELDSK is BIOS base + 27, hence WBOOT vector + 24.
+; SELDSK is the only way to ask whether a drive exists — BDOS has no such
+; call, and its login vector reports drives that have been used, not
+; drives that are present.
+BIOS_WBOOTV     EQU	0x0001
+SELDSK_OFFSET   EQU	24
+
+MAX_DIR_RECS    EQU	250              ; 16 bytes each, must fit RXBUF (4KB)
 C_WRITESTR      EQU	9
 C_WRITE         EQU	2
 
@@ -1069,11 +1088,9 @@ recv_session
 ;   -> status frame seq 1, record frame(s), zero-length terminator
 ;   <- ACK
 ;
-; NOTE: this build answers with canned data — no BDOS enumeration yet.
-; Replies are at most three frames, inside WIN_SIZE, so the client ACKs
-; only the terminator and no windowing is needed. A real CMD_DIR that
-; can exceed WIN_SIZE frames must consume mid-stream ACKs as send_file_tx
-; does.
+; Replies can exceed WIN_SIZE frames now that CMD_DIR enumerates a real
+; directory, so record frames go out through send_reply_frame, which
+; absorbs the client's window ACKs.
 ;
 ; Deliberately silent: no print_user_msg during the exchange. Console
 ; output in receive mode goes out this same UART, and would show up as
@@ -1170,35 +1187,106 @@ serve_command
                 LD	A, 1
                 CALL	send_frame
                 LD	A, 2
-                JR	.terminate
+                JP	.terminate
 
 .do_vols
+                CALL	enum_volumes
                 ; One frame carries the status byte and the single 5-byte
                 ; record together — §4 permits this when they fit.
-                LD	HL, vols_reply
-                LD	BC, VOLS_REPLY_LEN
+                LD	HL, vols_buf
+                LD	BC, VOLS_BUF_LEN
                 LD	A, 1
                 CALL	send_frame
                 LD	A, 2
-                JR	.terminate
+                JP	.terminate
 
 .do_dir
-                ; Record count is not known up front in the real
-                ; implementation, so send the status frame alone and stream
-                ; records behind it (§4).
+                ; Operands: [opcode][drive][user] and optionally an 11-byte
+                ; match pattern. Copy them out before enum_dir runs — it
+                ; builds its records in RXBUF, over this very payload.
+                LD	A, B
+                OR	A
+                JP	NZ, .err_operand
+                LD	A, C
+                CP	3
+                JR	Z, .dir_matchall
+                CP	14
+                JP	NZ, .err_operand
+                LD	HL, RXBUF + 3
+                LD	DE, dir_pattern
+                LD	BC, 11
+                LDIR
+                JR	.dir_operands
+.dir_matchall
+                LD	HL, dir_pattern
+                LD	B, 11
+                LD	A, '?'
+.dir_fillpat
+                LD	(HL), A
+                INC	HL
+                DJNZ	.dir_fillpat
+.dir_operands
+                LD	A, (RXBUF + 1)
+                LD	(dir_drive), A
+                LD	A, (RXBUF + 2)
+                LD	(dir_user), A
+
+                CALL	enum_dir
+                JP	C, .status_only ; A = status code
+
+                ; Record count is not known up front, so send the status
+                ; frame alone and stream records behind it (§4).
                 LD	A, ST_OK
                 LD	(cmd_status), A
                 LD	HL, cmd_status
                 LD	BC, 1
                 LD	A, 1
-                CALL	send_frame
+                CALL	send_reply_frame
 
-                LD	HL, dir_records
-                LD	BC, DIR_RECORDS_LEN
                 LD	A, 2
-                CALL	send_frame
+                LD	(reply_seq), A
+                LD	HL, RXBUF
+                LD	(reply_ptr), HL
+                LD	HL, (dir_bytes)
+                LD	(reply_left), HL
 
-                LD	A, 3
+.dir_frames
+                LD	HL, (reply_left)
+                LD	A, H
+                OR	L
+                JR	Z, .dir_frames_done
+
+                ; chunk = min(left, FRAME_SIZE); records never split because
+                ; FRAME_SIZE is a whole number of 16-byte records
+                LD	DE, FRAME_SIZE
+                OR	A
+                SBC	HL, DE
+                JR	C, .dir_last
+                LD	(reply_left), HL
+                LD	BC, FRAME_SIZE
+                JR	.dir_send
+.dir_last
+                LD	HL, (reply_left)
+                LD	B, H
+                LD	C, L
+                LD	HL, 0
+                LD	(reply_left), HL
+.dir_send
+                LD	HL, (reply_ptr)
+                PUSH	BC
+                LD	A, (reply_seq)
+                CALL	send_reply_frame
+                POP	BC
+                LD	HL, (reply_ptr)
+                ADD	HL, BC
+                LD	(reply_ptr), HL
+                LD	A, (reply_seq)
+                INC	A
+                LD	(reply_seq), A
+                JR	.dir_frames
+
+.dir_frames_done
+                LD	A, (reply_seq)
 
 .terminate
                 ; zero-length frame ends the reply stream; A = its seq
@@ -1232,6 +1320,24 @@ serve_command
                 RET
 
 ; ----------------------------------------------------------------------------
+; send_reply_frame — send one reply frame and absorb the window ACK.
+;
+; A = seq, HL = payload, BC = length. The client ACKs every WIN_SIZE frames
+; exactly as it does for file data, so a reply longer than WIN_SIZE frames
+; puts ACKs on the wire mid-stream. Left unread they would pile up behind
+; the terminator ACK and confuse the drain. Short replies never reach a
+; boundary and this costs nothing.
+; ----------------------------------------------------------------------------
+send_reply_frame
+                PUSH	AF
+                CALL	send_frame
+                POP	AF
+                AND	WIN_SIZE - 1
+                RET	NZ
+                CALL	recv_control_z80
+                RET
+
+; ----------------------------------------------------------------------------
 ; send_enq_echo — v0.3 §2 capability echo: CTRL_ENQ then the 4-byte VER.
 ; Unconditional and stateless. Trashes A, B, HL.
 ; ----------------------------------------------------------------------------
@@ -1251,21 +1357,397 @@ cmdset_ver      DB	'0', '0', '0', '1'  ; v0.3 §2 VER: major 00, minor 01
 cmd_status      DB	0
 cmd_retry       DB	0
 
-; --- canned CMD_VOLS reply (v0.3 §5) ----------------------------------------
-; [ST_OK][present_lo][present_hi][logged_lo][logged_hi][current]
-vols_reply      DB	ST_OK
-                DB	0x03, 0x00      ; present = A: and B:
-                DB	0x01, 0x00      ; logged  = A:
-                DB	0x00            ; current drive = A:
-VOLS_REPLY_LEN  EQU	$ - vols_reply
+; ============================================================================
+; call_seldsk — BIOS SELDSK for the drive in C.
+;
+; Returns HL = the drive's DPH address, or HL = 0 if the drive is absent.
+; That zero is the only presence test CP/M offers: BDOS has no "does this
+; drive exist" call, and DRV_LOGINVEC answers a different question.
+;
+; Reached through the WBOOT vector rather than a hardcoded address, so it
+; follows whatever BIOS this machine booted. Trashes A, DE, HL.
+; ============================================================================
+call_seldsk
+                LD	HL, (BIOS_WBOOTV)
+                LD	DE, SELDSK_OFFSET
+                ADD	HL, DE
+                LD	(seldsk_ptr), HL
+                LD	E, 0            ; bit 0 clear = log in as if new
+                CALL	.via_ptr
+                RET
+.via_ptr
+                LD	HL, (seldsk_ptr)
+                JP	(HL)            ; SELDSK's RET lands back in call_seldsk
 
-; --- canned CMD_DIR records (v0.3 §5) ---------------------------------------
-; 16 bytes each: [user][11-byte name][attr][3-byte size in 128-byte records]
-dir_records
-                DB	0, "SLIDE   COM", 0x00, 0x17, 0x00, 0x00
-                DB	0, "TEST    TXT", 0x00, 0x08, 0x00, 0x00
-                DB	0, "README  DOC", 0x01, 0x04, 0x00, 0x00
-DIR_RECORDS_LEN EQU	$ - dir_records
+; ============================================================================
+; enum_volumes — fill vols_buf for CMD_VOLS (v0.3 §5).
+;
+; Probes all 16 drives with BIOS SELDSK. Going behind BDOS's back leaves it
+; pointing at the last drive probed, so the current drive is saved first and
+; restored afterwards — otherwise every later file operation lands on the
+; wrong disk.
+; ============================================================================
+enum_volumes
+                LD	C, DRV_GET
+                CALL	BDOS
+                LD	(saved_drive), A
+                LD	(vols_current), A
+
+                LD	C, DRV_LOGINVEC
+                CALL	BDOS            ; HL = login vector
+                LD	(vols_logged), HL
+
+                LD	HL, 0           ; present bitmap
+                LD	DE, 1           ; bit mask for the drive under test
+                LD	B, 0            ; drive number
+.probe_loop
+                PUSH	HL
+                PUSH	DE
+                PUSH	BC
+                LD	C, B
+                CALL	call_seldsk
+                LD	A, H
+                OR	L               ; Z set = HL was 0 = drive absent
+                POP	BC
+                POP	DE
+                POP	HL              ; POPs do not disturb the flags
+                JR	Z, .absent
+                LD	A, H
+                OR	D
+                LD	H, A
+                LD	A, L
+                OR	E
+                LD	L, A
+.absent
+                EX	DE, HL          ; mask <<= 1
+                ADD	HL, HL
+                EX	DE, HL
+                INC	B
+                LD	A, B
+                CP	16
+                JR	NZ, .probe_loop
+
+                LD	(vols_present), HL
+
+                ; put BDOS back where it was
+                LD	A, (saved_drive)
+                LD	E, A
+                LD	C, DRV_SET
+                CALL	BDOS
+                RET
+
+vols_buf        DB	ST_OK
+vols_present    DW	0               ; LE bitmap, bit n = drive n selectable
+vols_logged     DW	0               ; LE bitmap, BDOS login vector
+vols_current    DB	0
+VOLS_BUF_LEN    EQU	$ - vols_buf
+
+; ============================================================================
+; enum_dir — build 16-byte CMD_DIR records into RXBUF (v0.3 §5).
+;
+; Entry: dir_drive = 0..15 or 0xFF for current, dir_user likewise,
+;        dir_pattern = 11-byte FCB-style match.
+; Exit:  carry clear, dir_bytes = record bytes written
+;        carry set, A = status code (§4)
+;
+; Two passes, because they cannot be interleaved: CP/M keeps ONE global
+; search state, so any other BDOS disk call between F_SNEXT calls destroys
+; it. Pass 1 walks the directory collecting names; pass 2 asks F_FSIZE for
+; each size afterwards.
+;
+; Only extent 0 is matched (search FCB ex = 0), so a file larger than 16KB
+; appears once rather than once per extent.
+; ============================================================================
+enum_dir
+                ; --- save the state we are about to disturb ---
+                LD	C, DRV_GET
+                CALL	BDOS
+                LD	(saved_drive), A
+
+                LD	E, 0xFF         ; 0xFF = interrogate, do not set
+                LD	C, F_USERNUM
+                CALL	BDOS
+                LD	(saved_user), A
+
+                ; --- select the requested drive ---
+                LD	A, (dir_drive)
+                CP	0xFF
+                JR	Z, .drive_ok    ; current drive, nothing to do
+                CP	16
+                JP	NC, .bad_operand
+
+                ; presence first: selecting an absent drive prompts BDOS to
+                ; ask the user to fix the disk, which nobody is there to do
+                LD	C, A
+                PUSH	BC
+                CALL	call_seldsk
+                POP	BC
+                LD	A, H
+                OR	L
+                JP	Z, .no_drive
+
+                LD	A, (dir_drive)
+                LD	E, A
+                LD	C, DRV_SET
+                CALL	BDOS
+.drive_ok
+                ; --- select the requested user ---
+                LD	A, (dir_user)
+                CP	0xFF
+                JR	Z, .user_ok
+                CP	16
+                JP	NC, .bad_operand
+                LD	E, A
+                LD	C, F_USERNUM
+                CALL	BDOS
+.user_ok
+                ; --- DMA for the directory buffer ---
+                LD	DE, DMA_ADDR
+                LD	C, F_SETDMA
+                CALL	BDOS
+
+                ; --- build the search FCB ---
+                CALL	build_search_fcb
+
+                LD	HL, RXBUF
+                LD	(dir_ptr), HL
+                XOR	A
+                LD	(dir_count), A
+
+                LD	DE, dir_fcb
+                LD	C, F_SFIRST
+                CALL	BDOS
+.search_loop
+                CP	0xFF
+                JR	Z, .search_done
+
+                CALL	store_dir_entry ; A = directory code 0..3
+                JR	C, .search_done ; record buffer full
+
+                LD	DE, dir_fcb
+                LD	C, F_SNEXT
+                CALL	BDOS
+                JR	.search_loop
+
+.search_done
+                ; --- pass 2: sizes, now that the search state is spent ---
+                CALL	fill_dir_sizes
+
+                ; dir_bytes = dir_count * 16
+                LD	A, (dir_count)
+                LD	L, A
+                LD	H, 0
+                ADD	HL, HL
+                ADD	HL, HL
+                ADD	HL, HL
+                ADD	HL, HL
+                LD	(dir_bytes), HL
+
+                CALL	restore_drive_user
+                OR	A               ; clear carry — success
+                RET
+
+.no_drive
+                LD	A, ST_NODRIVE
+                JR	.fail
+.bad_operand
+                LD	A, ST_OPERAND
+.fail
+                PUSH	AF
+                CALL	restore_drive_user
+                POP	AF
+                SCF
+                RET
+
+; restore_drive_user — put the current drive and user back as we found them.
+restore_drive_user
+                LD	A, (saved_user)
+                LD	E, A
+                LD	C, F_USERNUM
+                CALL	BDOS
+                LD	A, (saved_drive)
+                LD	E, A
+                LD	C, DRV_SET
+                CALL	BDOS
+                RET
+
+; build_search_fcb — zeroed FCB, current drive, dir_pattern, extent 0.
+build_search_fcb
+                LD	HL, dir_fcb
+                LD	B, 36
+                XOR	A
+.clr
+                LD	(HL), A
+                INC	HL
+                DJNZ	.clr
+
+                LD	HL, dir_pattern
+                LD	DE, dir_fcb + 1
+                LD	BC, 11
+                LDIR
+                RET                     ; drive byte and ex already 0
+
+; ============================================================================
+; store_dir_entry — append one 16-byte record for the match just found.
+; Entry: A = directory code (0..3); the entry is at DMA_ADDR + A*32.
+; Exit:  carry set if the record buffer is full.
+; ============================================================================
+store_dir_entry
+                ; HL = DMA_ADDR + A*32
+                AND	0x03
+                LD	L, A
+                LD	H, 0
+                ADD	HL, HL
+                ADD	HL, HL
+                ADD	HL, HL
+                ADD	HL, HL
+                ADD	HL, HL
+                LD	DE, DMA_ADDR
+                ADD	HL, DE
+
+                LD	A, (dir_count)
+                CP	MAX_DIR_RECS
+                JR	NC, .full
+
+                PUSH	HL              ; HL = directory entry
+                LD	DE, (dir_ptr)
+
+                LD	A, (HL)         ; byte 0 = user number
+                LD	(DE), A
+                INC	DE
+                INC	HL
+
+                ; 11 name bytes, attribute bits masked off
+                LD	B, 11
+.name_loop
+                LD	A, (HL)
+                AND	0x7F
+                LD	(DE), A
+                INC	HL
+                INC	DE
+                DJNZ	.name_loop
+
+                ; attributes live in the high bits of name bytes 8, 9, 10
+                POP	HL
+                PUSH	HL
+                LD	BC, 9           ; entry + 9 = name[8] = t1'
+                ADD	HL, BC
+                LD	A, (HL)
+                RLCA                    ; bit 7 -> bit 0
+                AND	0x01            ; R/O
+                LD	C, A
+                INC	HL
+                LD	A, (HL)
+                RLCA
+                AND	0x01
+                ADD	A, A            ; SYS -> bit 1
+                OR	C
+                LD	C, A
+                INC	HL
+                LD	A, (HL)
+                RLCA
+                AND	0x01
+                ADD	A, A
+                ADD	A, A            ; archive -> bit 2
+                OR	C
+                LD	(DE), A
+                INC	DE
+
+                XOR	A               ; size filled in by pass 2
+                LD	(DE), A
+                INC	DE
+                LD	(DE), A
+                INC	DE
+                LD	(DE), A
+                INC	DE
+
+                LD	(dir_ptr), DE
+                POP	HL
+
+                LD	A, (dir_count)
+                INC	A
+                LD	(dir_count), A
+                OR	A               ; clear carry
+                RET
+.full
+                SCF
+                RET
+
+; ============================================================================
+; fill_dir_sizes — pass 2. For every collected record, ask F_FSIZE for the
+; file size and write it into the record's 3-byte size field.
+;
+; Must run after the search completes: F_FSIZE is a BDOS disk call and would
+; destroy the search state if interleaved with F_SNEXT.
+; ============================================================================
+fill_dir_sizes
+                LD	A, (dir_count)
+                OR	A
+                RET	Z
+                LD	B, A
+                LD	HL, RXBUF
+.size_loop
+                PUSH	BC
+                PUSH	HL
+
+                ; FCB for this record: drive 0 (current), name, extent 0
+                PUSH	HL
+                LD	HL, dir_fcb
+                LD	B, 36
+                XOR	A
+.clr2
+                LD	(HL), A
+                INC	HL
+                DJNZ	.clr2
+                POP	HL
+
+                PUSH	HL
+                INC	HL              ; skip the user byte
+                LD	DE, dir_fcb + 1
+                LD	BC, 11
+                LDIR
+                POP	HL
+
+                PUSH	HL
+                LD	DE, dir_fcb
+                LD	C, F_FSIZE
+                CALL	BDOS
+                POP	HL
+
+                ; record + 13..15 = FCB + 33..35 (24-bit LE record count)
+                PUSH	HL
+                LD	DE, 13
+                ADD	HL, DE
+                LD	A, (dir_fcb + 33)
+                LD	(HL), A
+                INC	HL
+                LD	A, (dir_fcb + 34)
+                LD	(HL), A
+                INC	HL
+                LD	A, (dir_fcb + 35)
+                LD	(HL), A
+                POP	HL
+
+                LD	DE, 16
+                ADD	HL, DE
+                POP	DE              ; discard the saved HL (we advanced it)
+                POP	BC
+                DJNZ	.size_loop
+                RET
+
+seldsk_ptr      DW	0
+reply_seq       DB	0
+reply_ptr       DW	0
+reply_left      DW	0
+saved_drive     DB	0
+saved_user      DB	0
+dir_drive       DB	0xFF
+dir_user        DB	0xFF
+dir_count       DB	0
+dir_ptr         DW	0
+dir_bytes       DW	0
+dir_pattern     DS	11
+dir_fcb         DS	36
 
 ; ============================================================================
 ; Main file receive loop (single file, called by recv_session)

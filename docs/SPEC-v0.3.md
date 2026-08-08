@@ -320,6 +320,14 @@ A server with no better source than BDOS 24 MAY set `present` equal to
 `logged`. Clients SHOULD present `present` to the user and MAY use
 `logged` to hint which volumes are already spun up.
 
+The reference firmware fills `present` by calling **BIOS `SELDSK`**
+directly for each of the 16 drives: it returns the drive's DPH address, or
+zero if the drive does not exist. That zero is the only presence test CP/M
+offers, which is why the answer cannot come from BDOS at all. `SELDSK` is
+reached through the WBOOT vector at `0x0001` (BIOS base + 3, so `SELDSK`
+is that address + 24) rather than a fixed address, so it follows whichever
+BIOS the machine booted.
+
 ### `CMD_DIR` (0x02)
 
 Command payload:
@@ -477,6 +485,18 @@ a NanoBeast:
 - **The reply stream is stable.** 40 consecutive `CMD_DIR` exchanges with
   no failure (`slide-py/soak_dir.py`), after the selective-drain fix in §9.
   Before that fix the same harness failed 1 run in 14.
+- **Real enumeration agrees with CP/M.** Against a drive holding 51 files,
+  `CMD_DIR` returned exactly the entries `DIR` lists, in the same order,
+  with no duplicates — including three files over 16 KB, which confirms the
+  extent coalescing. Sizes matched the on-disk files rounded up to 128-byte
+  records, and the one R/O file reported its attribute. `CMD_VOLS` reported
+  the correct present and logged bitmaps and left the current drive
+  unchanged.
+
+Not yet exercised: a reply longer than one frame. 51 records is 816 bytes,
+inside `FRAME_SIZE`, so the multi-frame path and the window-ACK absorption
+in `send_reply_frame` have never run. That needs a directory of more than
+64 entries.
 
 The intermittent failure that fix addresses is worth remembering as a
 class: a correct-looking reply followed by a silently hung session, where
@@ -564,6 +584,44 @@ avoid it too.
 Clients SHOULD surface this text to the operator rather than discarding
 it. A client that drains before probing (as §2 recommends) will collect
 it, and it is exactly the information the operator wanted to see.
+
+#### Saving and restoring drive and user (required)
+
+Enumeration disturbs global CP/M state, and a server MUST put it back.
+
+Calling BIOS `SELDSK` goes behind BDOS's back: BDOS still believes the old
+drive is current while the BIOS points at the last one probed. `CMD_DIR`
+compounds this by selecting a drive and possibly a user number. Leave
+either changed and every later file operation in the session lands on the
+wrong disk or the wrong user — including the file transfers that share the
+session, which would then write to a volume the operator never chose.
+
+So, around any enumeration:
+
+1. Save the current drive (BDOS 25) and the current user (BDOS 32 with
+   `E = 0xFF` interrogates rather than sets).
+2. Enumerate.
+3. Restore both, on **every** exit path including the error ones. Restore
+   the user first, then the drive.
+
+`CMD_DIR` should also test a requested drive with `SELDSK` *before*
+selecting it with BDOS 14. Selecting a drive that is not there makes BDOS
+prompt the operator to correct the disk, and in a remotely driven session
+there is nobody at the keyboard to answer.
+
+#### Two passes for CMD_DIR (required)
+
+CP/M keeps exactly **one** global search state. Any other BDOS disk call
+between `F_SNEXT` calls destroys it, and `F_FSIZE` is a BDOS disk call. A
+server MUST therefore enumerate in two passes: walk the directory
+collecting names first, then ask `F_FSIZE` for each size once the search is
+finished. Interleaving them silently truncates or corrupts the listing.
+
+This is why record sizes are buffered rather than streamed: the whole
+listing has to exist in memory before any size is known. The reference
+firmware caps at 250 records to stay inside its 4 KB buffer, and larger
+directories are truncated without a distinct status — a known limit, not a
+design decision worth copying if you have the memory to avoid it.
 
 #### Draining after a reply stream (required)
 
