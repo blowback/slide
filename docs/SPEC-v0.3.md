@@ -473,7 +473,8 @@ command exchange", which cannot be tested until a v0.3 server exists.
 ### Verification status — v0.3 ↔ v0.3
 
 The `v0.3 client → v0.3 server` row is also measured, against `slide.com`
-v0.6.0-dev (canned data, no BDOS enumeration yet) on both a MicroBeast and
+v0.6.0 — at that point still a pre-release build answering with canned
+data, before the BDOS enumeration landed — on both a MicroBeast and
 a NanoBeast:
 
 - **The capability exchange works.** `CTRL_ENQ` draws an echo plus VER
@@ -662,7 +663,8 @@ the drain runs — so the flush eats it. When the swallowed byte is
 `.file_loop` has no retry budget, so the session hangs with no error
 reported on either side, and the board needs a power cycle.
 
-Measured with `slide-py/soak_dir.py` against `slide.com` v0.6.0-dev:
+Measured with `slide-py/soak_dir.py` against a pre-release `slide.com`
+v0.6.0:
 **one failure in 14 `CMD_DIR` runs**. The diagnostic that settles it is to
 send a second `CTRL_FIN` after the failure — it is echoed immediately,
 proving the server was alive in its file loop and the first FIN was
