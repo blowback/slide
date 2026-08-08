@@ -61,6 +61,8 @@ CTRL_ENQ        EQU	0x05             ; v0.3 §2: a command frame follows
 CMD_NOP         EQU	0x00             ; no-op; completes a probe-only exchange
 CMD_VOLS        EQU	0x01             ; list available volumes
 CMD_DIR         EQU	0x02             ; directory listing
+CMD_DEL         EQU	0x03             ; delete file(s)
+CMD_REN         EQU	0x04             ; rename a file
 
 ; How long to wait for the command frame after echoing ENQ. Shorter than
 ; MAX_RETRIES: a client that echoes and then goes quiet is misbehaving, and
@@ -74,6 +76,9 @@ ST_OPERAND      EQU	0x02             ; missing or malformed operand
 ST_NODRIVE      EQU	0x03             ; drive not present or not selectable
 ST_IO           EQU	0x04             ; BDOS/BIOS error during enumeration
 ST_BUSY         EQU	0x05             ; cannot service the request now
+ST_NOFILE       EQU	0x06             ; nothing matched
+ST_EXISTS       EQU	0x07             ; destination already exists
+ST_RO           EQU	0x08             ; file is read-only
 
 WIN_SIZE        EQU	4                ; sliding window size
 FRAME_SIZE      EQU	1024             ; payload bytes per frame
@@ -89,6 +94,7 @@ CMDTEXT         EQU	0x0081           ; command tail text
 F_OPEN          EQU	15
 F_CLOSE         EQU	16
 F_DELETE        EQU	19
+F_RENAME        EQU	23               ; rename (double FCB: old at +1, new at +17)
 F_READ          EQU	20
 F_WRITE         EQU	21
 F_CREATE        EQU	22
@@ -1174,6 +1180,10 @@ serve_command
                 JR	Z, .do_vols
                 CP	CMD_DIR
                 JR	Z, .do_dir
+                CP	CMD_DEL
+                JP	Z, .do_del
+                CP	CMD_REN
+                JP	Z, .do_ren
 
                 LD	A, ST_OPCODE
                 JR	.status_only
@@ -1296,6 +1306,68 @@ serve_command
 
 .dir_frames_done
                 LD	A, (reply_seq)
+                JP	.terminate
+
+.do_del
+                ; [opcode][drive][user][pattern 11] — the pattern is required,
+                ; there is deliberately no "delete everything" default
+                LD	A, B
+                OR	A
+                JP	NZ, .err_operand
+                LD	A, C
+                CP	14
+                JP	NZ, .err_operand
+                LD	HL, RXBUF + 3
+                LD	DE, dir_pattern
+                LD	BC, 11
+                LDIR
+                LD	A, (RXBUF + 1)
+                LD	(dir_drive), A
+                LD	A, (RXBUF + 2)
+                LD	(dir_user), A
+
+                CALL	cmd_delete
+                JP	C, .status_only
+
+                ; status and the count share one frame, as §4 allows
+                LD	A, ST_OK
+                LD	(del_reply), A
+                LD	A, (match_count)
+                LD	(del_reply + 1), A
+                XOR	A
+                LD	(del_reply + 2), A
+                LD	HL, del_reply
+                LD	BC, 3
+                LD	A, 1
+                CALL	send_frame
+                LD	A, 2
+                JP	.terminate
+
+.do_ren
+                ; [opcode][drive][user][old 11][new 11]
+                LD	A, B
+                OR	A
+                JP	NZ, .err_operand
+                LD	A, C
+                CP	25
+                JP	NZ, .err_operand
+                LD	HL, RXBUF + 3
+                LD	DE, ren_oldname
+                LD	BC, 11
+                LDIR
+                LD	HL, RXBUF + 14
+                LD	DE, ren_newname
+                LD	BC, 11
+                LDIR
+                LD	A, (RXBUF + 1)
+                LD	(dir_drive), A
+                LD	A, (RXBUF + 2)
+                LD	(dir_user), A
+
+                CALL	cmd_rename
+                JP	C, .status_only
+                LD	A, ST_OK
+                JP	.status_only
 
 .terminate
                 ; zero-length frame ends the reply stream; A = its seq
@@ -1362,7 +1434,7 @@ send_enq_echo
                 DJNZ	.ve_loop
                 RET
 
-cmdset_ver      DB	'0', '0', '0', '1'  ; v0.3 §2 VER: major 00, minor 01
+cmdset_ver      DB	'0', '0', '0', '2'  ; v0.3 §2 VER: major 00, minor 02
 cmd_status      DB	0
 cmd_retry       DB	0
 
@@ -1467,8 +1539,15 @@ VOLS_BUF_LEN    EQU	$ - vols_buf
 ; Only extent 0 is matched (search FCB ex = 0), so a file larger than 16KB
 ; appears once rather than once per extent.
 ; ============================================================================
-enum_dir
-                ; --- save the state we are about to disturb ---
+; ============================================================================
+; cmd_select_target — save the current drive and user, then select whatever
+; dir_drive / dir_user ask for, and point DMA at the directory buffer.
+; Shared by every command that touches the filesystem.
+;
+; Exit: carry clear, drive and user selected
+;       carry set, A = status code, state already restored
+; ============================================================================
+cmd_select_target
                 LD	C, DRV_GET
                 CALL	BDOS
                 LD	(saved_drive), A
@@ -1478,12 +1557,11 @@ enum_dir
                 CALL	BDOS
                 LD	(saved_user), A
 
-                ; --- select the requested drive ---
                 LD	A, (dir_drive)
                 CP	0xFF
                 JR	Z, .drive_ok    ; current drive, nothing to do
                 CP	16
-                JP	NC, .bad_operand
+                JR	NC, .bad_operand
 
                 ; presence first: selecting an absent drive prompts BDOS to
                 ; ask the user to fix the disk, which nobody is there to do
@@ -1493,29 +1571,223 @@ enum_dir
                 POP	BC
                 LD	A, H
                 OR	L
-                JP	Z, .no_drive
+                JR	Z, .no_drive
 
                 LD	A, (dir_drive)
                 LD	E, A
                 LD	C, DRV_SET
                 CALL	BDOS
 .drive_ok
-                ; --- select the requested user ---
                 LD	A, (dir_user)
                 CP	0xFF
                 JR	Z, .user_ok
                 CP	16
-                JP	NC, .bad_operand
+                JR	NC, .bad_operand
                 LD	E, A
                 LD	C, F_USERNUM
                 CALL	BDOS
 .user_ok
-                ; --- DMA for the directory buffer ---
                 LD	DE, DMA_ADDR
                 LD	C, F_SETDMA
                 CALL	BDOS
+                OR	A               ; clear carry
+                RET
 
-                ; --- build the search FCB ---
+.no_drive
+                LD	A, ST_NODRIVE
+                JR	.fail
+.bad_operand
+                LD	A, ST_OPERAND
+.fail
+                PUSH	AF
+                CALL	restore_drive_user
+                POP	AF
+                SCF
+                RET
+
+; ============================================================================
+; scan_matches — count files matching dir_pattern, and note whether any of
+; them is read-only.
+;
+; The R/O check is not cosmetic. Deleting or renaming a read-only file makes
+; CP/M print "Bdos Err On x: File R/O" and warm-boot, which would kill the
+; session mid-command with no reply on the wire. Callers test this first
+; rather than letting BDOS decide.
+;
+; Exit: A = match count (saturating at 255), match_ro set if any is R/O.
+; ============================================================================
+scan_matches
+                XOR	A
+                LD	(match_count), A
+                LD	(match_ro), A
+
+                CALL	build_search_fcb
+                LD	DE, dir_fcb
+                LD	C, F_SFIRST
+                CALL	BDOS
+.sm_loop
+                CP	0xFF
+                JR	Z, .sm_done
+                CALL	note_match_ro
+                LD	A, (match_count)
+                INC	A
+                JR	Z, .sm_capped
+                LD	(match_count), A
+.sm_next
+                LD	DE, dir_fcb
+                LD	C, F_SNEXT
+                CALL	BDOS
+                JR	.sm_loop
+.sm_capped
+                LD	A, 255
+                LD	(match_count), A
+                JR	.sm_next
+.sm_done
+                LD	A, (match_count)
+                RET
+
+; note_match_ro — A = directory code; set match_ro if that entry is R/O.
+note_match_ro
+                AND	0x03
+                LD	L, A
+                LD	H, 0
+                ADD	HL, HL
+                ADD	HL, HL
+                ADD	HL, HL
+                ADD	HL, HL
+                ADD	HL, HL
+                LD	DE, DMA_ADDR
+                ADD	HL, DE
+                LD	DE, 9           ; t1' carries the R/O bit
+                ADD	HL, DE
+                LD	A, (HL)
+                AND	0x80
+                RET	Z
+                LD	A, 1
+                LD	(match_ro), A
+                RET
+
+; ============================================================================
+; cmd_delete — CMD_DEL. Deletes everything matching dir_pattern.
+; Exit: carry clear and match_count files deleted, or carry set with A = status.
+; ============================================================================
+cmd_delete
+                CALL	cmd_select_target
+                RET	C
+
+                CALL	scan_matches
+                OR	A
+                JR	Z, .none
+                LD	A, (match_ro)
+                OR	A
+                JR	NZ, .readonly
+
+                ; the search left dir_fcb in whatever state BDOS wanted it,
+                ; so rebuild from the pattern before handing it to F_DELETE
+                CALL	build_search_fcb
+                LD	DE, dir_fcb
+                LD	C, F_DELETE
+                CALL	BDOS
+                CP	0xFF
+                JR	Z, .failed
+
+                CALL	restore_drive_user
+                OR	A
+                RET
+.none
+                LD	A, ST_NOFILE
+                JR	.fail
+.readonly
+                LD	A, ST_RO
+                JR	.fail
+.failed
+                LD	A, ST_IO
+.fail
+                PUSH	AF
+                CALL	restore_drive_user
+                POP	AF
+                SCF
+                RET
+
+; ============================================================================
+; cmd_rename — CMD_REN. ren_oldname -> ren_newname on the selected drive.
+;
+; Checks both ends first: CP/M's F_RENAME will happily create a second file
+; with an existing name, and renaming a read-only file warm-boots us.
+; ============================================================================
+cmd_rename
+                CALL	cmd_select_target
+                RET	C
+
+                LD	HL, ren_oldname
+                LD	DE, dir_pattern
+                LD	BC, 11
+                LDIR
+                CALL	scan_matches
+                OR	A
+                JR	Z, .none
+                LD	A, (match_ro)
+                OR	A
+                JR	NZ, .readonly
+
+                LD	HL, ren_newname
+                LD	DE, dir_pattern
+                LD	BC, 11
+                LDIR
+                CALL	scan_matches
+                OR	A
+                JR	NZ, .exists
+
+                CALL	build_rename_fcb
+                LD	DE, dir_fcb
+                LD	C, F_RENAME
+                CALL	BDOS
+                CP	0xFF
+                JR	Z, .failed
+
+                CALL	restore_drive_user
+                OR	A
+                RET
+.none
+                LD	A, ST_NOFILE
+                JR	.fail
+.readonly
+                LD	A, ST_RO
+                JR	.fail
+.exists
+                LD	A, ST_EXISTS
+                JR	.fail
+.failed
+                LD	A, ST_IO
+.fail
+                PUSH	AF
+                CALL	restore_drive_user
+                POP	AF
+                SCF
+                RET
+
+; build_rename_fcb — F_RENAME wants a double FCB: old name at +1, new at +17.
+build_rename_fcb
+                LD	HL, dir_fcb
+                LD	B, 36
+                XOR	A
+.brf_clr
+                LD	(HL), A
+                INC	HL
+                DJNZ	.brf_clr
+                LD	HL, ren_oldname
+                LD	DE, dir_fcb + 1
+                LD	BC, 11
+                LDIR
+                LD	HL, ren_newname
+                LD	DE, dir_fcb + 17
+                LD	BC, 11
+                LDIR
+                RET
+
+enum_dir
+                CALL	cmd_select_target
+                RET	C
                 CALL	build_search_fcb
 
                 LD	HL, RXBUF
@@ -1554,18 +1826,6 @@ enum_dir
 
                 CALL	restore_drive_user
                 OR	A               ; clear carry — success
-                RET
-
-.no_drive
-                LD	A, ST_NODRIVE
-                JR	.fail
-.bad_operand
-                LD	A, ST_OPERAND
-.fail
-                PUSH	AF
-                CALL	restore_drive_user
-                POP	AF
-                SCF
                 RET
 
 ; restore_drive_user — put the current drive and user back as we found them.
@@ -1757,6 +2017,11 @@ dir_ptr         DW	0
 dir_bytes       DW	0
 dir_pattern     DS	11
 dir_fcb         DS	36
+match_count     DB	0
+match_ro        DB	0
+ren_oldname     DS	11
+ren_newname     DS	11
+del_reply       DS	3
 
 ; ============================================================================
 ; Main file receive loop (single file, called by recv_session)

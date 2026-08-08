@@ -394,7 +394,7 @@ pub const CMDSET_VER_LEN: usize = 4;
 /// Major version this implementation speaks.
 pub const CMDSET_MAJOR: u8 = 0;
 /// Minor version this implementation speaks.
-pub const CMDSET_MINOR: u8 = 1;
+pub const CMDSET_MINOR: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProbeOutcome {
@@ -576,6 +576,8 @@ fn read_version(
 pub const CMD_NOP: u8 = 0x00;
 pub const CMD_VOLS: u8 = 0x01;
 pub const CMD_DIR: u8 = 0x02;
+pub const CMD_DEL: u8 = 0x03;
+pub const CMD_REN: u8 = 0x04;
 
 /// A decoded v0.3 §4 reply stream.
 pub struct CommandReply {
@@ -594,6 +596,9 @@ pub fn status_name(status: u8) -> &'static str {
         0x03 => "ST_NODRIVE — drive not present or not selectable",
         0x04 => "ST_IO — BDOS/BIOS error during enumeration",
         0x05 => "ST_BUSY — server cannot service the request now",
+        0x06 => "ST_NOFILE — nothing matched",
+        0x07 => "ST_EXISTS — destination already exists",
+        0x08 => "ST_RO — file is read-only",
         _ => "unknown status",
     }
 }

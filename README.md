@@ -166,6 +166,27 @@ The MicroBeast checks the drive is really there (BIOS `SELDSK` again) before sel
 
 Sizes come from `F_FSIZE`, so they're in whole 128-byte records — treat them as an upper bound, same as CP/M's own `stat` does. Files bigger than 16K appear once, not once per extent.
 
+### Deleting and renaming
+
+```
+slide probe /dev/ttyUSB0 --cmd del --match OLDFILE.BAK
+slide probe /dev/ttyUSB0 --cmd ren --match OLD.TXT --to NEW.TXT
+```
+
+`--match` takes a CP/M pattern, so `*.BAK` and `A?.COM` work the way you'd expect. Delete reports how many files went:
+
+```
+--- CMD_DEL (B: ????????.BAK) ---
+  Status: 0x00 — ST_OK
+  Deleted 3 file(s)
+```
+
+You can filter a listing the same way: `--cmd dir --match "*.COM"`.
+
+Two safety notes. There's no "delete everything" default — `--cmd del` without `--match` is an error, not a wildcard. And a `--match` containing a wildcard needs `--yes` as well, because CP/M has no undelete and `--drive` makes it far too easy to aim at the wrong disk.
+
+The MicroBeast checks before it acts: it refuses with `ST_RO` rather than touching a read-only file, and refuses a rename with `ST_EXISTS` if the target name is taken. Both matter more than they sound — CP/M's own rename will cheerfully create two files with the same name, and deleting a read-only file prints `Bdos Err` and reboots the machine out from under the session.
+
 ### Driving it without a terminal
 
 If your terminal *is* the serial port — which it is, on a MicroBeast — you can't start `slide` on the Beast and then hand the port over to the PC tool. There's no moment when both can have it.
@@ -200,7 +221,10 @@ slide probe <port> [options]
 
 What to run, and where:
 
-- `--cmd nop|vols|dir` — which command to send (default: `nop`, which just asks "do you speak v0.3?" and gets out of the way)
+- `--cmd nop|vols|dir|del|ren` — which command to send (default: `nop`, which just asks "do you speak v0.3?" and gets out of the way)
+- `--match PATTERN` — filename or CP/M pattern. Filters `dir`, required for `del`, names the existing file for `ren`
+- `--to NAME` — the new name, for `ren`
+- `--yes` — allow a wildcard `del` without confirmation
 - `--drive A-P|0-15` — drive to list with `--cmd dir`. Omit for the currently selected one
 - `--user 0-15` — CP/M user number to list. Omit for the current one
 - `--start-cmd "slide r"` — type this at the MicroBeast's CP/M prompt instead of needing a separate terminal

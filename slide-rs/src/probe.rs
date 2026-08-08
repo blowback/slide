@@ -171,6 +171,56 @@ fn report(result: &ProbeResult, label: &str) {
 }
 
 
+/// Turn a CP/M-ish glob into the 11-byte FCB form the wire uses: 8 name
+/// bytes then 3 type bytes, space padded, `?` as the single-character
+/// wildcard. `*` fills the rest of its field with `?`, as CP/M does.
+fn parse_pattern(spec: &str) -> Result<Vec<u8>> {
+    let up = spec.trim().to_ascii_uppercase();
+    if up.is_empty() {
+        bail!("empty pattern");
+    }
+    let (name, ext) = match up.split_once('.') {
+        Some((n, e)) => (n.to_string(), e.to_string()),
+        None => (up.clone(), String::new()),
+    };
+    fn field(src: &str, width: usize) -> Result<Vec<u8>> {
+        let mut out: Vec<u8> = Vec::with_capacity(width);
+        for ch in src.chars() {
+            if out.len() == width {
+                break;
+            }
+            if ch == '*' {
+                while out.len() < width {
+                    out.push(b'?');
+                }
+                break;
+            }
+            if !ch.is_ascii() || ch.is_ascii_control() || ch == ' ' {
+                bail!("{ch:?} is not usable in a CP/M filename");
+            }
+            out.push(ch as u8);
+        }
+        while out.len() < width {
+            out.push(b' ');
+        }
+        Ok(out)
+    }
+    let mut p = field(&name, 8)?;
+    p.extend(field(&ext, 3)?);
+    Ok(p)
+}
+
+fn has_wildcard(pattern: &[u8]) -> bool {
+    pattern.contains(&b'?')
+}
+
+/// Render an 11-byte FCB pattern back as NAME.EXT for display.
+fn show_pattern(p: &[u8]) -> String {
+    let name = String::from_utf8_lossy(&p[0..8]).trim_end().to_string();
+    let ext = String::from_utf8_lossy(&p[8..11]).trim_end().to_string();
+    if ext.is_empty() { name } else { format!("{name}.{ext}") }
+}
+
 /// Parse a CP/M drive from the command line: "a", "A:", or a bare 0-15.
 /// Returns 0..15, or 0xFF for "whatever the Beast currently has selected"
 /// — the value v0.3 §5 reserves for that.
@@ -214,19 +264,42 @@ fn honour_enq_obligation(
     cmd: &str,
     drive: u8,
     user: u8,
+    pattern: Option<&Vec<u8>>,
+    rename_to: Option<&Vec<u8>>,
     debug: bool,
 ) -> Result<bool> {
     if !result.usable() {
         return Ok(true);
     }
+    // §5 operands always start [drive][user], 0xFF for "whatever is current"
     let (opcode, operands, label) = match cmd {
         "vols" => (CMD_VOLS, vec![], "CMD_VOLS".to_string()),
-        // §5 operands: [drive][user], 0xFF for "whatever is current"
-        "dir" => (
-            CMD_DIR,
-            vec![drive, user],
-            format!("CMD_DIR ({})", drive_label(drive)),
-        ),
+        "dir" => {
+            let mut ops = vec![drive, user];
+            let mut lbl = format!("CMD_DIR ({})", drive_label(drive));
+            if let Some(p) = pattern {
+                ops.extend_from_slice(p);
+                lbl = format!("CMD_DIR ({} {})", drive_label(drive), show_pattern(p));
+            }
+            (CMD_DIR, ops, lbl)
+        }
+        "del" => {
+            let p = pattern.expect("--match is required for del");
+            let mut ops = vec![drive, user];
+            ops.extend_from_slice(p);
+            (CMD_DEL, ops,
+             format!("CMD_DEL ({} {})", drive_label(drive), show_pattern(p)))
+        }
+        "ren" => {
+            let from = pattern.expect("--match is required for ren");
+            let to = rename_to.expect("--to is required for ren");
+            let mut ops = vec![drive, user];
+            ops.extend_from_slice(from);
+            ops.extend_from_slice(to);
+            (CMD_REN, ops,
+             format!("CMD_REN ({} {} -> {})", drive_label(drive),
+                     show_pattern(from), show_pattern(to)))
+        }
         _ => (CMD_NOP, vec![], "CMD_NOP".to_string()),
     };
     println!("{}", style(format!("--- {label} ---")).bold());
@@ -265,6 +338,9 @@ pub fn probe_session(
     cmd: &str,
     drive: Option<&str>,
     user: Option<&str>,
+    r#match: Option<&str>,
+    rename_to: Option<&str>,
+    assume_yes: bool,
     then_send: Option<&str>,
     probe_after: bool,
     skip_fin: bool,
@@ -284,6 +360,41 @@ pub fn probe_session(
         if !Path::new(f).exists() {
             bail!("File not found: {f}");
         }
+    }
+
+    let drive_n = parse_drive(drive)?;
+    let user_n = parse_drive(user)?;   // same 0-15 / 0xFF shape
+    let pattern = match r#match {
+        Some(m) => Some(parse_pattern(m)?),
+        None => None,
+    };
+    let to_pattern = match rename_to {
+        Some(m) => Some(parse_pattern(m)?),
+        None => None,
+    };
+
+    match cmd {
+        "del" => {
+            let Some(p) = pattern.as_ref() else {
+                bail!("--cmd del needs --match; there is no delete-everything default");
+            };
+            // A wildcard delete on CP/M is unrecoverable, and --drive makes it
+            // easy to aim at the wrong disk. Make the user say so out loud.
+            if has_wildcard(p) && !assume_yes {
+                bail!("--match {} is a wildcard and would delete every match on {}. \
+Re-run with --yes if that is what you want.",
+                      show_pattern(p), drive_label(drive_n));
+            }
+        }
+        "ren" => {
+            if pattern.is_none() {
+                bail!("--cmd ren needs --match for the existing name");
+            }
+            if to_pattern.is_none() {
+                bail!("--cmd ren needs --to for the new name");
+            }
+        }
+        _ => {}
     }
 
     let mut port = open_serial(port_name, baud)?;
@@ -323,9 +434,8 @@ pub fn probe_session(
 
     // v0.3 §2: an echo obliges us to send exactly one command frame.
     let mut session_ok = true;
-    let drive_n = parse_drive(drive)?;
-    let user_n = parse_drive(user)?;   // same 0-15 / 0xFF shape
-    if !honour_enq_obligation(port.as_mut(), &result, cmd, drive_n, user_n, debug)? {
+    if !honour_enq_obligation(port.as_mut(), &result, cmd, drive_n, user_n,
+                              pattern.as_ref(), to_pattern.as_ref(), debug)? {
         session_ok = false;
     }
 
@@ -377,7 +487,8 @@ pub fn probe_session(
                 style("NOTE:").yellow().bold()
             );
         }
-        if !honour_enq_obligation(port.as_mut(), &after, "nop", 0xFF, 0xFF, debug)? {
+        if !honour_enq_obligation(port.as_mut(), &after, "nop", 0xFF, 0xFF,
+                                  None, None, debug)? {
             session_ok = false;
         }
         if !after.discarded.is_empty() {
@@ -475,5 +586,52 @@ mod tests {
         assert_eq!(drive_label(1), "B:");
         assert_eq!(drive_label(15), "P:");
         assert_eq!(drive_label(0xFF), "current drive");
+    }
+}
+
+#[cfg(test)]
+mod pattern_tests {
+    use super::*;
+
+    fn p(s: &str) -> String {
+        String::from_utf8(parse_pattern(s).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn patterns_become_fcb_fields() {
+        assert_eq!(p("FOO.TXT"), "FOO     TXT");
+        assert_eq!(p("foo.txt"), "FOO     TXT");   // upcased
+        assert_eq!(p("FOO"), "FOO        ");       // no type
+        assert_eq!(p("*.BAK"), "????????BAK");
+        assert_eq!(p("*.*"), "???????????");
+        assert_eq!(p("A?.COM"), "A?      COM");
+        assert_eq!(p("SLIDE.*"), "SLIDE   ???");
+        // over-long fields truncate, as CP/M does
+        assert_eq!(p("VERYLONGNAME.EXTRA"), "VERYLONGEXT");
+    }
+
+    #[test]
+    fn patterns_reject_junk() {
+        assert!(parse_pattern("").is_err());
+        assert!(parse_pattern("   ").is_err());
+        assert!(parse_pattern("A B.TXT").is_err());  // embedded space
+    }
+
+    #[test]
+    fn wildcards_are_detected() {
+        // This gates the destructive-delete confirmation, so it must not
+        // miss a wildcard that only appears in the type field.
+        assert!(has_wildcard(&parse_pattern("*.BAK").unwrap()));
+        assert!(has_wildcard(&parse_pattern("SLIDE.*").unwrap()));
+        assert!(has_wildcard(&parse_pattern("A?.COM").unwrap()));
+        assert!(!has_wildcard(&parse_pattern("FOO.TXT").unwrap()));
+        assert!(!has_wildcard(&parse_pattern("FOO").unwrap()));
+    }
+
+    #[test]
+    fn patterns_round_trip_for_display() {
+        assert_eq!(show_pattern(&parse_pattern("FOO.TXT").unwrap()), "FOO.TXT");
+        assert_eq!(show_pattern(&parse_pattern("FOO").unwrap()), "FOO");
+        assert_eq!(show_pattern(&parse_pattern("*.BAK").unwrap()), "????????.BAK");
     }
 }

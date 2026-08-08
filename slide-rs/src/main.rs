@@ -63,8 +63,9 @@ enum Commands {
         /// requiring a separate terminal (e.g. "slide r" or "b:slide r")
         #[arg(long, value_name = "CMD")]
         start_cmd: Option<String>,
-        /// Command to issue if the peer supports them: nop, vols, or dir
-        #[arg(long, default_value = "nop", value_parser = ["nop", "vols", "dir"])]
+        /// Command to issue if the peer supports them
+        #[arg(long, default_value = "nop",
+              value_parser = ["nop", "vols", "dir", "del", "ren"])]
         cmd: String,
         /// Drive to list with --cmd dir: A-P or 0-15. Omit for the drive
         /// the MicroBeast currently has selected
@@ -73,6 +74,16 @@ enum Commands {
         /// User number to list with --cmd dir: 0-15. Omit for the current one
         #[arg(long)]
         user: Option<String>,
+        /// Filename or pattern, e.g. "*.BAK". Filters --cmd dir; required
+        /// for --cmd del and names the existing file for --cmd ren
+        #[arg(long)]
+        r#match: Option<String>,
+        /// New name for --cmd ren
+        #[arg(long)]
+        to: Option<String>,
+        /// Allow a wildcard --cmd del without confirmation
+        #[arg(long)]
+        yes: bool,
         /// After probing, send FILE to prove the session still works
         #[arg(long, value_name = "FILE")]
         then_send: Option<String>,
@@ -99,10 +110,11 @@ fn main() {
             recv::recv_session(&port, baud, &output_dir, debug)
         }
         Commands::Probe { port, baud, attempts, timeout, settle, start_cmd, cmd, drive, user,
-                          then_send, probe_after, no_fin, debug } => {
+                          r#match, to, yes, then_send, probe_after, no_fin, debug } => {
             probe::probe_session(&port, baud, attempts, timeout, settle,
                                  start_cmd.as_deref(), &cmd,
                                  drive.as_deref(), user.as_deref(),
+                                 r#match.as_deref(), to.as_deref(), yes,
                                  then_send.as_deref(), probe_after, no_fin, debug)
         }
     };

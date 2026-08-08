@@ -20,7 +20,7 @@ import os
 import sys
 
 from slide.common import (
-    CTRL_ENQ, CTRL_FIN, CTRL_CAN,
+    CTRL_ENQ, CTRL_FIN, CTRL_CAN, CMD_DEL, CMD_REN,
     CMDSET_MAJOR, CMDSET_MINOR,
     ProbeOutcome,
     open_serial, handshake_as_sender, send_start_command,
@@ -127,6 +127,45 @@ def report(result, label: str) -> None:
     print()
 
 
+def parse_pattern(spec: str) -> bytes:
+    """
+    Turn a CP/M-ish glob into the 11-byte FCB form the wire uses: 8 name
+    bytes then 3 type bytes, space padded, '?' as the single-character
+    wildcard. '*' fills the rest of its field with '?', as CP/M does.
+    """
+    up = spec.strip().upper()
+    if not up:
+        raise ValueError("empty pattern")
+    name, _, ext = up.partition('.')
+
+    def field(src, width):
+        out = bytearray()
+        for ch in src:
+            if len(out) == width:
+                break
+            if ch == '*':
+                out.extend(b'?' * (width - len(out)))
+                break
+            if not ch.isascii() or ch.isspace() or ord(ch) < 0x20:
+                raise ValueError(f"{ch!r} is not usable in a CP/M filename")
+            out.append(ord(ch))
+        out.extend(b' ' * (width - len(out)))
+        return bytes(out)
+
+    return field(name, 8) + field(ext, 3)
+
+
+def has_wildcard(pattern: bytes) -> bool:
+    return b'?' in pattern
+
+
+def show_pattern(p: bytes) -> str:
+    """Render an 11-byte FCB pattern back as NAME.EXT for display."""
+    name = p[0:8].decode('ascii', 'replace').rstrip()
+    ext = p[8:11].decode('ascii', 'replace').rstrip()
+    return f"{name}.{ext}" if ext else name
+
+
 def parse_drive(arg) -> int:
     """
     Parse a CP/M drive from the command line: "a", "A:", or a bare 0-15.
@@ -157,7 +196,7 @@ def drive_label(d: int) -> str:
 
 
 def _honour_enq_obligation(ser, result, cmd: str, drive: int, user: int,
-                           debug: bool) -> bool:
+                           pattern, to_pattern, debug: bool) -> bool:
     """
     v0.3 §2: an echo obliges the client to send exactly one command frame.
     Even when we only wanted to probe, the server is in command mode and
@@ -167,12 +206,26 @@ def _honour_enq_obligation(ser, result, cmd: str, drive: int, user: int,
     if not result.usable:
         return True
 
-    # §5 operands: [drive][user], 0xFF for "whatever is current"
-    opcode, operands, label = {
-        'vols': (CMD_VOLS, b'', 'CMD_VOLS'),
-        'dir': (CMD_DIR, bytes([drive, user]),
-                f'CMD_DIR ({drive_label(drive)})'),
-    }.get(cmd, (CMD_NOP, b'', 'CMD_NOP'))
+    # §5 operands always start [drive][user], 0xFF for "whatever is current"
+    head = bytes([drive, user])
+    if cmd == 'vols':
+        opcode, operands, label = CMD_VOLS, b'', 'CMD_VOLS'
+    elif cmd == 'dir':
+        opcode = CMD_DIR
+        operands = head + (pattern or b'')
+        label = f'CMD_DIR ({drive_label(drive)}'
+        label += f' {show_pattern(pattern)})' if pattern else ')'
+    elif cmd == 'del':
+        opcode = CMD_DEL
+        operands = head + pattern
+        label = f'CMD_DEL ({drive_label(drive)} {show_pattern(pattern)})'
+    elif cmd == 'ren':
+        opcode = CMD_REN
+        operands = head + pattern + to_pattern
+        label = (f'CMD_REN ({drive_label(drive)} {show_pattern(pattern)}'
+                 f' -> {show_pattern(to_pattern)})')
+    else:
+        opcode, operands, label = CMD_NOP, b'', 'CMD_NOP'
 
     print(f"--- {label} ---")
     try:
@@ -199,7 +252,8 @@ def probe_session(port: str, baud: int = 19200, attempts: int = 3,
                   echo_timeout: float = 0.5, settle: float = 0.1,
                   start_cmd: str = None, cmd: str = 'nop',
                   drive: str = None, user: str = None,
-                  then_send: str = None,
+                  match: str = None, rename_to: str = None,
+                  assume_yes: bool = False, then_send: str = None,
                   probe_after: bool = False, skip_fin: bool = False,
                   debug: bool = False) -> int:
     """Handshake, probe, optionally transfer a file, then close the session."""
@@ -209,6 +263,28 @@ def probe_session(port: str, baud: int = 19200, attempts: int = 3,
     print(f"  Probe: ENQ 0x{CTRL_ENQ:02X}, {attempts} attempt(s), "
           f"{echo_timeout:.1f}s echo timeout")
     print()
+
+    drive_n = parse_drive(drive)
+    user_n = parse_drive(user)
+    pattern = parse_pattern(match) if match else None
+    to_pattern = parse_pattern(rename_to) if rename_to else None
+
+    if cmd == 'del':
+        if pattern is None:
+            raise ValueError("--cmd del needs --match; there is no "
+                             "delete-everything default")
+        # A wildcard delete on CP/M is unrecoverable, and --drive makes it
+        # easy to aim at the wrong disk. Make the user say so out loud.
+        if has_wildcard(pattern) and not assume_yes:
+            raise ValueError(
+                f"--match {show_pattern(pattern)} is a wildcard and would "
+                f"delete every match on {drive_label(drive_n)}. "
+                f"Re-run with --yes if that is what you want.")
+    elif cmd == 'ren':
+        if pattern is None:
+            raise ValueError("--cmd ren needs --match for the existing name")
+        if to_pattern is None:
+            raise ValueError("--cmd ren needs --to for the new name")
 
     ser = open_serial(port, baud)
 
@@ -237,9 +313,8 @@ def probe_session(port: str, baud: int = 19200, attempts: int = 3,
         return 1
 
     # v0.3 §2: an echo obliges us to send exactly one command frame.
-    session_ok = _honour_enq_obligation(ser, result, cmd,
-                                        parse_drive(drive), parse_drive(user),
-                                        debug)
+    session_ok = _honour_enq_obligation(ser, result, cmd, drive_n, user_n,
+                                        pattern, to_pattern, debug)
 
     if then_send:
         print(f"--- Sending {then_send} to confirm the session still works ---")
@@ -266,7 +341,8 @@ def probe_session(port: str, baud: int = 19200, attempts: int = 3,
             return 1
         if after.outcome is not result.outcome:
             print("  NOTE: post-transfer outcome differs from the post-handshake one.")
-        if not _honour_enq_obligation(ser, after, 'nop', 0xFF, 0xFF, debug):
+        if not _honour_enq_obligation(ser, after, 'nop', 0xFF, 0xFF,
+                                      None, None, debug):
             session_ok = False
         if after.discarded:
             print(f"  NOTE: {len(after.discarded)} byte(s) were still queued "
@@ -331,7 +407,8 @@ def main():
                         help="Type this at the peer's CP/M prompt to start it, "
                              "instead of requiring a separate terminal "
                              "(e.g. 'slide r' or 'b:slide r')")
-    parser.add_argument('--cmd', default='nop', choices=['nop', 'vols', 'dir'],
+    parser.add_argument('--cmd', default='nop',
+                        choices=['nop', 'vols', 'dir', 'del', 'ren'],
                         help='Command to issue if the peer supports them '
                              '(default: nop)')
     parser.add_argument('--drive',
@@ -340,6 +417,13 @@ def main():
     parser.add_argument('--user',
                         help='User number to list with --cmd dir: 0-15. Omit '
                              'for the current one')
+    parser.add_argument('--match',
+                        help='Filename or pattern, e.g. "*.BAK". Filters '
+                             '--cmd dir; required for --cmd del and names the '
+                             'existing file for --cmd ren')
+    parser.add_argument('--to', help='New name for --cmd ren')
+    parser.add_argument('--yes', action='store_true',
+                        help='Allow a wildcard --cmd del without confirmation')
     parser.add_argument('--then-send', metavar='FILE',
                         help='After probing, send FILE to prove the session still works')
     parser.add_argument('--probe-after', action='store_true',
@@ -358,7 +442,8 @@ def main():
     sys.exit(probe_session(args.port, args.baud, args.attempts,
                            args.timeout / 1000.0, args.settle / 1000.0,
                            args.start_cmd, args.cmd,
-                           args.drive, args.user, args.then_send,
+                           args.drive, args.user, args.match, args.to,
+                           args.yes, args.then_send,
                            args.probe_after, args.no_fin, args.debug))
 
 

@@ -211,7 +211,7 @@ def handshake_as_sender(ser: serial.Serial, timeout: float = 60.0,
 
 CMDSET_VER_LEN = 4   # VER is 4 ASCII digits, 'MMmm'
 CMDSET_MAJOR   = 0   # major version this implementation speaks
-CMDSET_MINOR   = 1   # minor version this implementation speaks
+CMDSET_MINOR   = 2   # minor version this implementation speaks
 
 
 class ProbeOutcome(str, Enum):
@@ -408,6 +408,8 @@ def _read_version(ser: serial.Serial, timeout: float, stray: bytearray,
 CMD_NOP  = 0x00   # no-op; completes a probe-only exchange
 CMD_VOLS = 0x01
 CMD_DIR  = 0x02
+CMD_DEL  = 0x03
+CMD_REN  = 0x04
 
 _STATUS_NAMES = {
     0x00: "ST_OK",
@@ -416,6 +418,9 @@ _STATUS_NAMES = {
     0x03: "ST_NODRIVE — drive not present or not selectable",
     0x04: "ST_IO — BDOS/BIOS error during enumeration",
     0x05: "ST_BUSY — server cannot service the request now",
+    0x06: "ST_NOFILE — nothing matched",
+    0x07: "ST_EXISTS — destination already exists",
+    0x08: "ST_RO — file is read-only",
 }
 
 
