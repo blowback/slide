@@ -6,7 +6,7 @@ File transfer from PC to the [FeerSum Beasts MicroBeast Z80 Computer](https://fe
 
 Sliding window protocol with CRC-16 error detection and hardware flow control.
 
-95%+ link utilisation for files > 2K. CP/M binary is 2.5 KBytes.
+95%+ link utilisation for files > 2K. CP/M binary is 3.7 KBytes.
 
 Other Z80 based computers are available, and might work with a bit of fiddling about. IO ports and baud rates and such.
 
