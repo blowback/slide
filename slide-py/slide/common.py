@@ -145,6 +145,13 @@ class HandshakeResult:
     connected: bool = False
     wakeup_seen: bool = False   # v0.2.1 §1 signature observed while waiting
     strays: int = 0             # non-control bytes skipped (banner, echo)
+    # The peer echoed our RDY back as "^Q" — RDY is 0x11, which is Ctrl-Q,
+    # and CP/M's command prompt echoes control characters that way. It means
+    # we are talking to the CCP, not to SLIDE.
+    saw_ccp_echo: bool = False
+    # First stretch of stray bytes, so the caller can show what the peer
+    # actually said (typically a banner, or "SLIDE?").
+    chatter: bytes = b''
 
 
 def handshake_as_sender(ser: serial.Serial, timeout: float = 60.0,
@@ -155,6 +162,8 @@ def handshake_as_sender(ser: serial.Serial, timeout: float = 60.0,
     """
     result = HandshakeResult()
     wakeup_pos = 0
+    prev_stray = 0
+    chatter = bytearray()
     deadline = time.time() + timeout
     while time.time() < deadline:
         ser.write(bytes([CTRL_RDY]))
@@ -185,6 +194,14 @@ def handshake_as_sender(ser: serial.Serial, timeout: float = 60.0,
                 return result
 
             result.strays += 1
+            if len(chatter) < 96:
+                chatter.append(b)
+                result.chatter = bytes(chatter)
+            # "^Q" is our own RDY coming back off a CP/M prompt.
+            if prev_stray == ord('^') and b == ord('Q'):
+                result.saw_ccp_echo = True
+                return result
+            prev_stray = b
             # Log the byte before testing it, so the completion notice below
             # lands after the byte that completed the match rather than
             # appearing to jump a byte early.
@@ -211,7 +228,7 @@ def handshake_as_sender(ser: serial.Serial, timeout: float = 60.0,
 
 CMDSET_VER_LEN = 4   # VER is 4 ASCII digits, 'MMmm'
 CMDSET_MAJOR   = 0   # major version this implementation speaks
-CMDSET_MINOR   = 1   # minor version this implementation speaks
+CMDSET_MINOR   = 2   # minor version this implementation speaks
 
 
 class ProbeOutcome(str, Enum):
@@ -408,6 +425,8 @@ def _read_version(ser: serial.Serial, timeout: float, stray: bytearray,
 CMD_NOP  = 0x00   # no-op; completes a probe-only exchange
 CMD_VOLS = 0x01
 CMD_DIR  = 0x02
+CMD_DEL  = 0x03
+CMD_REN  = 0x04
 
 _STATUS_NAMES = {
     0x00: "ST_OK",
@@ -416,6 +435,9 @@ _STATUS_NAMES = {
     0x03: "ST_NODRIVE — drive not present or not selectable",
     0x04: "ST_IO — BDOS/BIOS error during enumeration",
     0x05: "ST_BUSY — server cannot service the request now",
+    0x06: "ST_NOFILE — nothing matched",
+    0x07: "ST_EXISTS — destination already exists",
+    0x08: "ST_RO — file is read-only",
 }
 
 

@@ -308,6 +308,13 @@ pub struct HandshakeResult {
     pub wakeup_seen: bool,
     /// Count of non-control bytes skipped (banner text, command echo).
     pub strays: usize,
+    /// The peer echoed our RDY back as "^Q" — RDY is 0x11, which is Ctrl-Q,
+    /// and CP/M's command prompt echoes control characters that way. It
+    /// means we are talking to the CCP, not to SLIDE.
+    pub saw_ccp_echo: bool,
+    /// First stretch of stray bytes, kept so the caller can show what the
+    /// peer actually said (typically a banner, or "SLIDE?").
+    pub chatter: Vec<u8>,
 }
 
 /// v0.2 §"Startup handshake": the sender transmits RDY first and the
@@ -319,6 +326,7 @@ pub fn handshake_as_sender(
 ) -> Result<HandshakeResult> {
     let mut result = HandshakeResult::default();
     let mut wakeup_pos = 0usize;
+    let mut prev_stray = 0u8;
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         port.write_all(&[CTRL_RDY])?;
@@ -354,6 +362,15 @@ pub fn handshake_as_sender(
                 }
                 other => {
                     result.strays += 1;
+                    if result.chatter.len() < 96 {
+                        result.chatter.push(other);
+                    }
+                    // "^Q" is our own RDY coming back off a CP/M prompt.
+                    if prev_stray == b'^' && other == b'Q' {
+                        result.saw_ccp_echo = true;
+                        return Ok(result);
+                    }
+                    prev_stray = other;
                     // Log the byte before testing it, so the completion
                     // notice below lands after the byte that completed the
                     // match rather than appearing to jump a byte early.
@@ -394,7 +411,7 @@ pub const CMDSET_VER_LEN: usize = 4;
 /// Major version this implementation speaks.
 pub const CMDSET_MAJOR: u8 = 0;
 /// Minor version this implementation speaks.
-pub const CMDSET_MINOR: u8 = 1;
+pub const CMDSET_MINOR: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProbeOutcome {
@@ -576,6 +593,8 @@ fn read_version(
 pub const CMD_NOP: u8 = 0x00;
 pub const CMD_VOLS: u8 = 0x01;
 pub const CMD_DIR: u8 = 0x02;
+pub const CMD_DEL: u8 = 0x03;
+pub const CMD_REN: u8 = 0x04;
 
 /// A decoded v0.3 §4 reply stream.
 pub struct CommandReply {
@@ -594,6 +613,9 @@ pub fn status_name(status: u8) -> &'static str {
         0x03 => "ST_NODRIVE — drive not present or not selectable",
         0x04 => "ST_IO — BDOS/BIOS error during enumeration",
         0x05 => "ST_BUSY — server cannot service the request now",
+        0x06 => "ST_NOFILE — nothing matched",
+        0x07 => "ST_EXISTS — destination already exists",
+        0x08 => "ST_RO — file is read-only",
         _ => "unknown status",
     }
 }

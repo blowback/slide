@@ -83,7 +83,10 @@ CLIENT                              SERVER
 | `MM`  | 2     | `'00'`–`'99'` | Major — incompatible changes |
 | `mm`  | 2     | `'00'`–`'99'` | Minor — additive changes     |
 
-This spec is version **`'0001'`** — major 0, minor 1.
+This spec is version **`'0002'`** — major 0, minor 2. Minor 1 was the same
+protocol without `CMD_DEL` and `CMD_REN`; a minor-1 server answers
+`ST_OPCODE` to both, which is exactly the additive-within-major behaviour
+§2 promises.
 
 All four bytes lie in `0x30`–`0x39`, disjoint from every control byte, so
 a late or duplicated echo can never be mistaken for a control byte by a
@@ -201,7 +204,9 @@ A command frame is an ordinary v0.2.1 frame:
 | 0x00  | CMD_NOP    | none — completes a probe-only exchange |
 | 0x01  | CMD_VOLS   | none                             |
 | 0x02  | CMD_DIR    | drive, user, [match pattern]     |
-| 0x03–0x7F | —      | reserved for future amendments   |
+| 0x03  | CMD_DEL    | drive, user, match pattern       |
+| 0x04  | CMD_REN    | drive, user, old name, new name  |
+| 0x05–0x7F | —      | reserved for future amendments   |
 | 0x80–0xFF | —      | private / vendor use             |
 
 `CMD_NOP` exists because of the rule in §2: an echoed `CTRL_ENQ` obliges
@@ -254,6 +259,9 @@ is at least one byte:
 | 0x03  | ST_NODRIVE    | Drive not present or not selectable      |
 | 0x04  | ST_IO         | BDOS/BIOS error during enumeration       |
 | 0x05  | ST_BUSY       | Server cannot service the request now    |
+| 0x06  | ST_NOFILE     | Nothing matched                          |
+| 0x07  | ST_EXISTS     | Destination already exists               |
+| 0x08  | ST_RO         | File is read-only                        |
 
 On any non-zero status the server sends the zero-length terminator
 immediately and emits no record frames.
@@ -384,6 +392,73 @@ non-zero, and to obtain the true size with `F_FSIZE` per file. That is
 one extra BDOS call per file, which is why a large directory takes
 noticeable time to enumerate; clients SHOULD allow for it in their
 timeouts.
+
+### `CMD_DEL` (0x03)
+
+Command payload:
+
+```
+[0x03] [DRIVE] [USER] [MATCH (11 bytes)]
+```
+
+`DRIVE` and `USER` as for `CMD_DIR`. The match pattern is **mandatory** —
+`LEN` must be 14, and anything else is `ST_OPERAND`. There is deliberately
+no "no pattern means everything" default: this is the one command whose
+mistakes cannot be undone, and an omitted operand must not be the thing
+that erases a disk.
+
+Reply: one record, 2 bytes.
+
+| Offset | Size | Field | Meaning                                    |
+|--------|------|-------|--------------------------------------------|
+| 0      | 2    | count | LE count of files deleted                  |
+
+Status and count fit one frame together, as §4 permits.
+
+`ST_NOFILE` if the pattern matched nothing. `ST_RO` if any match is
+read-only — see below.
+
+### `CMD_REN` (0x04)
+
+Command payload:
+
+```
+[0x04] [DRIVE] [USER] [OLD (11 bytes)] [NEW (11 bytes)]
+```
+
+`LEN` must be 25. Both names are FCB-form patterns for encoding purposes,
+but wildcards in either are undefined behaviour; send exact names.
+
+Reply: status only, no records.
+
+`ST_NOFILE` if the old name does not exist, `ST_EXISTS` if the new one
+already does, `ST_RO` if the old file is read-only.
+
+### Servers MUST check before mutating
+
+Both commands MUST verify their preconditions themselves rather than
+letting BDOS discover them:
+
+- **Read-only files.** Deleting or renaming an R/O file makes CP/M print
+  `Bdos Err On x: File R/O` and warm-boot. That kills the server
+  mid-command: the client gets no reply, no `FIN`, and the board needs
+  attention. A server MUST scan for matches first, test the R/O attribute,
+  and answer `ST_RO` instead of handing BDOS a file it will refuse.
+- **Existing destinations.** CP/M's `F_RENAME` does not check whether the
+  new name is taken, and will happily create a second directory entry with
+  the same name. A server MUST search for the destination first and answer
+  `ST_EXISTS`.
+
+Both checks fall out of one directory scan each, which the server needs
+anyway to report the delete count.
+
+### Clients SHOULD make destructive commands deliberate
+
+`CMD_DEL` is the first command in the protocol that destroys data, and
+`DRIVE` makes it easy to aim at the wrong disk. The protocol deliberately
+carries no confirmation round trip — that belongs in the client. The
+reference clients require an explicit pattern, and require a separate
+opt-in flag before sending one containing a wildcard.
 
 ## §6. The one prohibition
 
@@ -765,9 +840,10 @@ frame alone and stream records behind it.
 ## §11. Versioning
 
 - Wire protocol version: **v0.3**.
-- Command-set version (the `CTRL_ENQ` echo's `VER` field): **`'0001'`**.
-- Reference Z80 application: `slide.com` v0.6 (first version
-  implementing wire v0.3).
+- Command-set version (the `CTRL_ENQ` echo's `VER` field): **`'0002'`**.
+- Reference Z80 application: `slide.com` v0.6.1. v0.6.0 was the first
+  version implementing wire v0.3, at command set `'0001'`; v0.6.1 added
+  `CMD_DEL` and `CMD_REN` at `'0002'`.
 - Compatibility floor: wire v0.2.1 / `slide.com` v0.5.0.
 
 ### Why `VER` is not the wire version
