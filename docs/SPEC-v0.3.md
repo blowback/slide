@@ -766,13 +766,39 @@ frame alone and stream records behind it.
 - Command-set version (the `CTRL_ENQ` echo's `VER` field): **`'0001'`**.
 - Reference Z80 application: `slide.com` v0.6 (first version
   implementing wire v0.3).
-
-The command-set version and the wire version are deliberately separate
-numbers. Adding an opcode bumps the command-set minor and nothing else —
-it is not a wire change, and a v0.3 client and a v0.3 server with
-different minors interoperate on the opcodes they share. Only a change
-to framing, control bytes or session flow bumps the wire version.
 - Compatibility floor: wire v0.2.1 / `slide.com` v0.5.0.
+
+### Why `VER` is not the wire version
+
+`VER` reads `'0001'` in a document titled v0.3, which invites the
+question. It is deliberate: **`VER` is the command-set version, and the
+wire version cannot be substituted for it.**
+
+The `MMmm` encoding carries a contract (§2). An unknown major forbids
+sending commands at all; a higher minor is guaranteed safe, because the
+command set is additive within a major. Wire versions carry no such
+promise. If `VER` reported the wire version, a future v0.4 that changed
+framing would arrive as `'0004'` — same major, higher minor — and a v0.3
+client would read that as "safe, use the opcodes I know" and walk into a
+changed frame format. Conflating the two numbers is a correctness bug,
+not just untidy naming.
+
+They also move independently in both directions:
+
+| Change | Wire version | `VER` |
+|--------|--------------|-------|
+| Add `CMD_RENAME` | unchanged | minor bump |
+| Add a record field to `CMD_DIR` | unchanged | minor bump |
+| Renumber the opcodes | unchanged | **major** bump |
+| Add a control byte, or change framing | bump | unchanged |
+| Change the session handshake | bump | unchanged |
+
+And wire versions are dotted triples. `0.2.1` has no sensible `MMmm`
+rendering, so the field could not carry it even if the semantics matched.
+
+The cost is one more number in a repository that already has too many
+(§"Compatibility floor"). The alternative is a client that cannot tell
+"new opcodes exist" from "the frame format moved".
 
 ## §12. Cross-references
 
