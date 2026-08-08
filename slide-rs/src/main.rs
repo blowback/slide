@@ -1,6 +1,7 @@
 mod protocol;
 mod send;
 mod recv;
+mod probe;
 
 use clap::{Parser, Subcommand};
 
@@ -41,6 +42,51 @@ enum Commands {
         #[arg(long)]
         debug: bool,
     },
+    /// Probe a peer for v0.3 command-channel support (wire v0.3 §2)
+    Probe {
+        /// Serial port (e.g., /dev/ttyUSB0, COM3)
+        port: String,
+        /// Baud rate
+        #[arg(long, default_value_t = 19200)]
+        baud: u32,
+        /// Probe attempts before giving up
+        #[arg(long, default_value_t = 3)]
+        attempts: u32,
+        /// Milliseconds to wait for each echo
+        #[arg(long, default_value_t = 500)]
+        timeout: u64,
+        /// Milliseconds to wait after handshake before probing, to clear
+        /// the post-RDY FIFO flush
+        #[arg(long, default_value_t = 100)]
+        settle: u64,
+        /// Type this at the peer's CP/M prompt to start it, instead of
+        /// requiring a separate terminal (e.g. "slide r" or "b:slide r")
+        #[arg(long, value_name = "CMD")]
+        start_cmd: Option<String>,
+        /// Command to issue if the peer supports them: nop, vols, or dir
+        #[arg(long, default_value = "nop", value_parser = ["nop", "vols", "dir"])]
+        cmd: String,
+        /// Drive to list with --cmd dir: A-P or 0-15. Omit for the drive
+        /// the MicroBeast currently has selected
+        #[arg(long)]
+        drive: Option<String>,
+        /// User number to list with --cmd dir: 0-15. Omit for the current one
+        #[arg(long)]
+        user: Option<String>,
+        /// After probing, send FILE to prove the session still works
+        #[arg(long, value_name = "FILE")]
+        then_send: Option<String>,
+        /// Probe again after the file transfer, covering the v0.3 §2
+        /// post-transfer position (use with --then-send)
+        #[arg(long)]
+        probe_after: bool,
+        /// Leave the peer in its file loop instead of closing
+        #[arg(long)]
+        no_fin: bool,
+        /// Show wire-level debug output
+        #[arg(long)]
+        debug: bool,
+    },
 }
 
 fn main() {
@@ -51,6 +97,13 @@ fn main() {
         }
         Commands::Recv { port, baud, output_dir, debug } => {
             recv::recv_session(&port, baud, &output_dir, debug)
+        }
+        Commands::Probe { port, baud, attempts, timeout, settle, start_cmd, cmd, drive, user,
+                          then_send, probe_after, no_fin, debug } => {
+            probe::probe_session(&port, baud, attempts, timeout, settle,
+                                 start_cmd.as_deref(), &cmd,
+                                 drive.as_deref(), user.as_deref(),
+                                 then_send.as_deref(), probe_after, no_fin, debug)
         }
     };
     if let Err(e) = result {
