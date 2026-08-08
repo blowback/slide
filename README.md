@@ -154,7 +154,17 @@ slide probe /dev/ttyUSB0 --cmd dir
   ...
 ```
 
-Lists the current drive and user. Sizes come from `F_FSIZE`, so they're in whole 128-byte records — treat them as an upper bound, same as CP/M's own `stat` does. Files bigger than 16K appear once, not once per extent.
+With no arguments that lists whatever drive the MicroBeast currently has selected. To pick one:
+
+```
+slide probe /dev/ttyUSB0 --cmd dir --drive b:
+```
+
+`--drive` takes `a:`, `A`, or a bare `0`-`15`. There's a `--user` too, same idea, for CP/M user numbers. Leave either out and you get the current one.
+
+The MicroBeast checks the drive is really there (BIOS `SELDSK` again) before selecting it, and puts the previous drive and user back afterwards — so listing `B:` doesn't leave the rest of your session pointed at the wrong disk.
+
+Sizes come from `F_FSIZE`, so they're in whole 128-byte records — treat them as an upper bound, same as CP/M's own `stat` does. Files bigger than 16K appear once, not once per extent.
 
 ### Driving it without a terminal
 

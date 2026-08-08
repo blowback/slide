@@ -66,6 +66,13 @@ enum Commands {
         /// Command to issue if the peer supports them: nop, vols, or dir
         #[arg(long, default_value = "nop", value_parser = ["nop", "vols", "dir"])]
         cmd: String,
+        /// Drive to list with --cmd dir: A-P or 0-15. Omit for the drive
+        /// the MicroBeast currently has selected
+        #[arg(long)]
+        drive: Option<String>,
+        /// User number to list with --cmd dir: 0-15. Omit for the current one
+        #[arg(long)]
+        user: Option<String>,
         /// After probing, send FILE to prove the session still works
         #[arg(long, value_name = "FILE")]
         then_send: Option<String>,
@@ -91,11 +98,12 @@ fn main() {
         Commands::Recv { port, baud, output_dir, debug } => {
             recv::recv_session(&port, baud, &output_dir, debug)
         }
-        Commands::Probe { port, baud, attempts, timeout, settle, start_cmd, cmd, then_send,
-                          probe_after, no_fin, debug } => {
+        Commands::Probe { port, baud, attempts, timeout, settle, start_cmd, cmd, drive, user,
+                          then_send, probe_after, no_fin, debug } => {
             probe::probe_session(&port, baud, attempts, timeout, settle,
-                                 start_cmd.as_deref(), &cmd, then_send.as_deref(),
-                                 probe_after, no_fin, debug)
+                                 start_cmd.as_deref(), &cmd,
+                                 drive.as_deref(), user.as_deref(),
+                                 then_send.as_deref(), probe_after, no_fin, debug)
         }
     };
     if let Err(e) = result {

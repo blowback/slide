@@ -171,6 +171,39 @@ fn report(result: &ProbeResult, label: &str) {
 }
 
 
+/// Parse a CP/M drive from the command line: "a", "A:", or a bare 0-15.
+/// Returns 0..15, or 0xFF for "whatever the Beast currently has selected"
+/// — the value v0.3 §5 reserves for that.
+fn parse_drive(arg: Option<&str>) -> Result<u8> {
+    let Some(raw) = arg else { return Ok(0xFF) };
+    let t = raw.trim().trim_end_matches(':');
+    if t.is_empty() {
+        bail!("empty drive: {raw:?}");
+    }
+    let first = t.chars().next().unwrap();
+    if t.chars().count() == 1 && first.is_ascii_alphabetic() {
+        let n = first.to_ascii_uppercase() as u8 - b'A';
+        if n > 15 {
+            bail!("drive out of range: {raw:?} (A-P)");
+        }
+        return Ok(n);
+    }
+    match t.parse::<u8>() {
+        Ok(n) if n <= 15 => Ok(n),
+        Ok(_) => bail!("drive out of range: {raw:?} (0-15)"),
+        Err(_) => bail!("cannot read {raw:?} as a drive — use A-P or 0-15"),
+    }
+}
+
+/// Human-readable name for a drive operand.
+fn drive_label(d: u8) -> String {
+    if d == 0xFF {
+        "current drive".to_string()
+    } else {
+        format!("{}:", (b'A' + d) as char)
+    }
+}
+
 /// v0.3 §2: an echo obliges the client to send exactly one command frame.
 /// Even when we only wanted to probe, the server is in command mode and
 /// would read a file header as a command — so complete the exchange with
@@ -179,16 +212,22 @@ fn honour_enq_obligation(
     port: &mut dyn serialport::SerialPort,
     result: &ProbeResult,
     cmd: &str,
+    drive: u8,
+    user: u8,
     debug: bool,
 ) -> Result<bool> {
     if !result.usable() {
         return Ok(true);
     }
     let (opcode, operands, label) = match cmd {
-        "vols" => (CMD_VOLS, vec![], "CMD_VOLS"),
-        // drive 0xFF = current, user 0xFF = current (§5)
-        "dir" => (CMD_DIR, vec![0xFFu8, 0xFF], "CMD_DIR"),
-        _ => (CMD_NOP, vec![], "CMD_NOP"),
+        "vols" => (CMD_VOLS, vec![], "CMD_VOLS".to_string()),
+        // §5 operands: [drive][user], 0xFF for "whatever is current"
+        "dir" => (
+            CMD_DIR,
+            vec![drive, user],
+            format!("CMD_DIR ({})", drive_label(drive)),
+        ),
+        _ => (CMD_NOP, vec![], "CMD_NOP".to_string()),
     };
     println!("{}", style(format!("--- {label} ---")).bold());
     match send_command(port, opcode, &operands, debug) {
@@ -224,6 +263,8 @@ pub fn probe_session(
     settle_ms: u64,
     start_cmd: Option<&str>,
     cmd: &str,
+    drive: Option<&str>,
+    user: Option<&str>,
     then_send: Option<&str>,
     probe_after: bool,
     skip_fin: bool,
@@ -282,7 +323,9 @@ pub fn probe_session(
 
     // v0.3 §2: an echo obliges us to send exactly one command frame.
     let mut session_ok = true;
-    if !honour_enq_obligation(port.as_mut(), &result, cmd, debug)? {
+    let drive_n = parse_drive(drive)?;
+    let user_n = parse_drive(user)?;   // same 0-15 / 0xFF shape
+    if !honour_enq_obligation(port.as_mut(), &result, cmd, drive_n, user_n, debug)? {
         session_ok = false;
     }
 
@@ -334,7 +377,7 @@ pub fn probe_session(
                 style("NOTE:").yellow().bold()
             );
         }
-        if !honour_enq_obligation(port.as_mut(), &after, "nop", debug)? {
+        if !honour_enq_obligation(port.as_mut(), &after, "nop", 0xFF, 0xFF, debug)? {
             session_ok = false;
         }
         if !after.discarded.is_empty() {
@@ -391,5 +434,46 @@ pub fn probe_session(
             style("VERDICT:").red().bold()
         );
         bail!("session did not close cleanly after the probe");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drive_accepts_letters_and_numbers() {
+        assert_eq!(parse_drive(Some("a")).unwrap(), 0);
+        assert_eq!(parse_drive(Some("A")).unwrap(), 0);
+        assert_eq!(parse_drive(Some("b:")).unwrap(), 1);
+        assert_eq!(parse_drive(Some("B:")).unwrap(), 1);
+        assert_eq!(parse_drive(Some("P")).unwrap(), 15);
+        assert_eq!(parse_drive(Some("0")).unwrap(), 0);
+        assert_eq!(parse_drive(Some("15")).unwrap(), 15);
+        assert_eq!(parse_drive(Some(" b: ")).unwrap(), 1);
+    }
+
+    #[test]
+    fn absent_drive_means_current() {
+        // v0.3 §5 reserves 0xFF for "whatever the peer has selected".
+        assert_eq!(parse_drive(None).unwrap(), 0xFF);
+    }
+
+    #[test]
+    fn drive_rejects_out_of_range_and_junk() {
+        assert!(parse_drive(Some("q")).is_err());   // past P
+        assert!(parse_drive(Some("16")).is_err());
+        assert!(parse_drive(Some("255")).is_err()); // must not sneak in as 0xFF
+        assert!(parse_drive(Some("")).is_err());
+        assert!(parse_drive(Some(":")).is_err());
+        assert!(parse_drive(Some("ab")).is_err());
+    }
+
+    #[test]
+    fn drive_label_reads_back() {
+        assert_eq!(drive_label(0), "A:");
+        assert_eq!(drive_label(1), "B:");
+        assert_eq!(drive_label(15), "P:");
+        assert_eq!(drive_label(0xFF), "current drive");
     }
 }

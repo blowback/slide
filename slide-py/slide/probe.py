@@ -127,7 +127,37 @@ def report(result, label: str) -> None:
     print()
 
 
-def _honour_enq_obligation(ser, result, cmd: str, debug: bool) -> bool:
+def parse_drive(arg) -> int:
+    """
+    Parse a CP/M drive from the command line: "a", "A:", or a bare 0-15.
+    Returns 0..15, or 0xFF for "whatever the Beast currently has selected"
+    — the value v0.3 §5 reserves for that.
+    """
+    if arg is None:
+        return 0xFF
+    t = arg.strip().rstrip(':')
+    if not t:
+        raise ValueError(f"empty drive: {arg!r}")
+    if len(t) == 1 and t.isalpha():
+        n = ord(t.upper()) - ord('A')
+        if n > 15:
+            raise ValueError(f"drive out of range: {arg!r} (A-P)")
+        return n
+    if not t.isdigit():
+        raise ValueError(f"cannot read {arg!r} as a drive — use A-P or 0-15")
+    n = int(t)
+    if n > 15:
+        raise ValueError(f"drive out of range: {arg!r} (0-15)")
+    return n
+
+
+def drive_label(d: int) -> str:
+    """Human-readable name for a drive operand."""
+    return 'current drive' if d == 0xFF else f"{chr(ord('A') + d)}:"
+
+
+def _honour_enq_obligation(ser, result, cmd: str, drive: int, user: int,
+                           debug: bool) -> bool:
     """
     v0.3 §2: an echo obliges the client to send exactly one command frame.
     Even when we only wanted to probe, the server is in command mode and
@@ -137,10 +167,11 @@ def _honour_enq_obligation(ser, result, cmd: str, debug: bool) -> bool:
     if not result.usable:
         return True
 
+    # §5 operands: [drive][user], 0xFF for "whatever is current"
     opcode, operands, label = {
-        # drive 0xFF = current, user 0xFF = current (§5)
         'vols': (CMD_VOLS, b'', 'CMD_VOLS'),
-        'dir': (CMD_DIR, bytes([0xFF, 0xFF]), 'CMD_DIR'),
+        'dir': (CMD_DIR, bytes([drive, user]),
+                f'CMD_DIR ({drive_label(drive)})'),
     }.get(cmd, (CMD_NOP, b'', 'CMD_NOP'))
 
     print(f"--- {label} ---")
@@ -167,6 +198,7 @@ def _honour_enq_obligation(ser, result, cmd: str, debug: bool) -> bool:
 def probe_session(port: str, baud: int = 19200, attempts: int = 3,
                   echo_timeout: float = 0.5, settle: float = 0.1,
                   start_cmd: str = None, cmd: str = 'nop',
+                  drive: str = None, user: str = None,
                   then_send: str = None,
                   probe_after: bool = False, skip_fin: bool = False,
                   debug: bool = False) -> int:
@@ -205,7 +237,9 @@ def probe_session(port: str, baud: int = 19200, attempts: int = 3,
         return 1
 
     # v0.3 §2: an echo obliges us to send exactly one command frame.
-    session_ok = _honour_enq_obligation(ser, result, cmd, debug)
+    session_ok = _honour_enq_obligation(ser, result, cmd,
+                                        parse_drive(drive), parse_drive(user),
+                                        debug)
 
     if then_send:
         print(f"--- Sending {then_send} to confirm the session still works ---")
@@ -232,7 +266,7 @@ def probe_session(port: str, baud: int = 19200, attempts: int = 3,
             return 1
         if after.outcome is not result.outcome:
             print("  NOTE: post-transfer outcome differs from the post-handshake one.")
-        if not _honour_enq_obligation(ser, after, 'nop', debug):
+        if not _honour_enq_obligation(ser, after, 'nop', 0xFF, 0xFF, debug):
             session_ok = False
         if after.discarded:
             print(f"  NOTE: {len(after.discarded)} byte(s) were still queued "
@@ -299,6 +333,12 @@ def main():
     parser.add_argument('--cmd', default='nop', choices=['nop', 'vols', 'dir'],
                         help='Command to issue if the peer supports them '
                              '(default: nop)')
+    parser.add_argument('--drive',
+                        help='Drive to list with --cmd dir: A-P or 0-15. Omit '
+                             'for the drive the MicroBeast currently has selected')
+    parser.add_argument('--user',
+                        help='User number to list with --cmd dir: 0-15. Omit '
+                             'for the current one')
     parser.add_argument('--then-send', metavar='FILE',
                         help='After probing, send FILE to prove the session still works')
     parser.add_argument('--probe-after', action='store_true',
@@ -316,8 +356,8 @@ def main():
 
     sys.exit(probe_session(args.port, args.baud, args.attempts, args.timeout,
                            args.settle, args.start_cmd, args.cmd,
-                           args.then_send, args.probe_after, args.no_fin,
-                           args.debug))
+                           args.drive, args.user, args.then_send,
+                           args.probe_after, args.no_fin, args.debug))
 
 
 if __name__ == '__main__':
