@@ -493,10 +493,14 @@ a NanoBeast:
   the correct present and logged bitmaps and left the current drive
   unchanged.
 
-Not yet exercised: a reply longer than one frame. 51 records is 816 bytes,
-inside `FRAME_SIZE`, so the multi-frame path and the window-ACK absorption
-in `send_reply_frame` have never run. That needs a directory of more than
-64 entries.
+- **Multi-frame replies work.** A real CP/M directory here holds ~60
+  entries, so a listing never fills more than one 64-record frame in
+  practice. The path was exercised instead by rebuilding with a smaller
+  per-frame chunk (`-DREPLY_CHUNK=128`, 8 records per frame) against the
+  same 52-file drive: 7 record frames, the last one partial at 64 bytes,
+  and the client ACKing at seq 4 and seq 8 so `send_reply_frame` absorbed
+  two window ACKs before the terminator. Same code, same data, only the
+  chunk size changed.
 
 The intermittent failure that fix addresses is worth remembering as a
 class: a correct-looking reply followed by a silently hung session, where

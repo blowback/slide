@@ -110,6 +110,15 @@ BIOS_WBOOTV     EQU	0x0001
 SELDSK_OFFSET   EQU	24
 
 MAX_DIR_RECS    EQU	250              ; 16 bytes each, must fit RXBUF (4KB)
+
+; Payload bytes per CMD_DIR record frame. Normally a full frame, which is
+; exactly 64 records. Real CP/M directories here hold ~60 entries, so the
+; multi-frame path would never run in practice; build with
+; -DREPLY_CHUNK=128 to force it and exercise the window-ACK absorption in
+; send_reply_frame against a real listing.
+    IFNDEF REPLY_CHUNK
+REPLY_CHUNK     EQU	FRAME_SIZE
+    ENDIF
 C_WRITESTR      EQU	9
 C_WRITE         EQU	2
 
@@ -1258,12 +1267,12 @@ serve_command
 
                 ; chunk = min(left, FRAME_SIZE); records never split because
                 ; FRAME_SIZE is a whole number of 16-byte records
-                LD	DE, FRAME_SIZE
+                LD	DE, REPLY_CHUNK
                 OR	A
                 SBC	HL, DE
                 JR	C, .dir_last
                 LD	(reply_left), HL
-                LD	BC, FRAME_SIZE
+                LD	BC, REPLY_CHUNK
                 JR	.dir_send
 .dir_last
                 LD	HL, (reply_left)
