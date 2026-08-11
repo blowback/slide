@@ -10,9 +10,14 @@ Sliding window protocol with CRC-16 error detection and hardware flow control.
 
 ![Transfer example](images/transfer.png)
 
-Other Z80 based computers are available, and might work with a bit of fiddling about. IO ports and baud rates and such. 
 
-> [!WARNING]
+## compatibility
+
+SLIDE specifically targets the Feersum Technology MicroBeast and NanoBeast computers. It's built to take full advantage 
+of their specific hardware. Other Z80 based computers are available, and *might* work with a bit of fiddling about. 
+IO ports and baud rates and such. 
+
+> [!NOTE]
 > Note that SLIDE relies on 8-bit transfers and hardware flow control. It can
 > work without flow control, but it's not as efficient. You *could* adapt it to
 > work in 7 bits (or fewer), but you'd probably be better of with the battle
