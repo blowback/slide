@@ -8,9 +8,9 @@ Sliding window protocol with CRC-16 error detection and hardware flow control.
 
 95%+ link utilisation for files > 2K. CP/M binary is 3.7 KBytes.
 
-Other Z80 based computers are available, and might work with a bit of fiddling about. IO ports and baud rates and such. 
-
 ![Transfer example](images/transfer.png)
+
+Other Z80 based computers are available, and might work with a bit of fiddling about. IO ports and baud rates and such. 
 
 > [!WARNING]
 > Note that SLIDE relies on 8-bit transfers and hardware flow control. It can
