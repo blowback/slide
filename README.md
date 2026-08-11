@@ -10,6 +10,8 @@ Sliding window protocol with CRC-16 error detection and hardware flow control.
 
 Other Z80 based computers are available, and might work with a bit of fiddling about. IO ports and baud rates and such. 
 
+![Transfer example](images/transfer.png)
+
 > [!WARNING]
 > Note that SLIDE relies on 8-bit transfers and hardware flow control. It can
 > work without flow control, but it's not as efficient. You *could* adapt it to
@@ -17,7 +19,6 @@ Other Z80 based computers are available, and might work with a bit of fiddling a
 > tested [ZMP](https://github.com/mecparts/zmp) (ZMODEM) if you're restricted to
 > an "8-bit clear" system.
 
-![Transfer example](images/transfer.png)
 
 ## Installation
 
