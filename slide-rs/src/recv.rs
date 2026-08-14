@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 
 use crate::protocol::*;
 
-pub fn recv_session(port_name: &str, baud: u32, output_dir: &str, debug: bool) -> Result<()> {
+pub fn recv_session(port_name: &str, files: &[String], baud: u32, output_dir: &str, debug: bool, generic_cpm: bool) -> Result<()> {
+
+    let _ = generic_cpm; // Currently unused, but reserved for future use
+
     println!(
         "{} v0.2 — Serial Line Inter-Device Exchange",
         style("SLIDE").cyan().bold()
@@ -29,8 +32,17 @@ pub fn recv_session(port_name: &str, baud: u32, output_dir: &str, debug: bool) -
             .template("{spinner:.cyan} {msg}")
             .unwrap(),
     );
-    spin.set_message("Waiting for Z80 sender (start SLIDE S <file> on Z80 now)...");
     spin.enable_steady_tick(Duration::from_millis(100));
+
+    if generic_cpm && !files.is_empty() {
+        let file_list = files.join(" ");
+        let command = format!("SLIDECPM S {}\n", file_list);
+        spin.set_message(format!("Sending command to Z80: SLIDECPM S {}", file_list));
+        port.write_all(command.as_bytes())?;
+        port.flush()?;
+    } else {
+        spin.set_message("Waiting for Z80 sender (start SLIDE S <file> on Z80 now)...");
+    }
 
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {

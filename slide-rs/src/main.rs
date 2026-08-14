@@ -26,11 +26,17 @@ enum Commands {
         /// Show wire-level debug output
         #[arg(long)]
         debug: bool,
+        /// Use generic CP/M protocol variant
+        #[arg(long)]
+        generic_cpm: bool,
     },
     /// Receive file(s) from Z80/CP/M
     Recv {
         /// Serial port (e.g., /dev/ttyUSB0, COM3)
         port: String,
+        /// Files(s) to receive
+        #[arg(required = false)]
+        files: Vec<String>,
         /// Baud rate
         #[arg(long, default_value_t = 19200)]
         baud: u32,
@@ -40,17 +46,20 @@ enum Commands {
         /// Show wire-level debug output
         #[arg(long)]
         debug: bool,
+        /// Use generic CP/M protocol variant
+        #[arg(long)]
+        generic_cpm: bool,
     },
 }
 
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
-        Commands::Send { port, files, baud, debug } => {
-            send::send_session(&port, &files, baud, debug)
+        Commands::Send { port, files, baud, debug, generic_cpm } => {
+            send::send_session(&port, &files, baud, debug, generic_cpm)
         }
-        Commands::Recv { port, baud, output_dir, debug } => {
-            recv::recv_session(&port, baud, &output_dir, debug)
+        Commands::Recv { port, files, baud, output_dir, debug, generic_cpm } => {
+            recv::recv_session(&port, &files, baud, &output_dir, debug, generic_cpm)
         }
     };
     if let Err(e) = result {

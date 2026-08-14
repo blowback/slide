@@ -11,3 +11,8 @@ TEST32
 *.zip
 CONTEXT.md
 slide-rs/target/
+
+slide-ts/node_modules/
+slide-ts/dist/
+
+*.log

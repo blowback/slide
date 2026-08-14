@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::protocol::*;
 
-pub fn send_session(port_name: &str, files: &[String], baud: u32, debug: bool) -> Result<()> {
+pub fn send_session(port_name: &str, files: &[String], baud: u32, debug: bool, generic_cpm: bool) -> Result<()> {
     println!(
         "{} v0.2 — Serial Line Inter-Device Exchange",
         style("SLIDE").cyan().bold()
@@ -35,8 +35,15 @@ pub fn send_session(port_name: &str, files: &[String], baud: u32, debug: bool) -
             .template("{spinner:.cyan} {msg}")
             .unwrap(),
     );
-    spin.set_message("Waiting for Z80 (start SLIDE R on Z80 now)...");
+
     spin.enable_steady_tick(Duration::from_millis(100));
+    if generic_cpm {
+        spin.set_message("Sending SLIDECPM R command to Z80...");
+        port.write_all(b"SLIDECPM R\n")?;
+        port.flush()?;
+    } else {
+        spin.set_message("Waiting for Z80 (start SLIDE S <file> on Z80 now)...");
+    }
 
     loop {
         port.write_all(&[CTRL_RDY])?;
