@@ -10,6 +10,7 @@ dependencies = [
 [project.scripts]
 slide-send = "slide.send:main"
 slide-recv = "slide.recv:main"
+slide-probe = "slide.probe:main"
 
 [build-system]
 requires = ["hatchling"]

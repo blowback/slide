@@ -103,7 +103,7 @@ pub fn send_session(port_name: &str, files: &[String], baud: u32, debug: bool, g
     Ok(())
 }
 
-fn send_file(port: &mut dyn serialport::SerialPort, filename: &str, debug: bool) -> Result<u64> {
+pub(crate) fn send_file(port: &mut dyn serialport::SerialPort, filename: &str, debug: bool) -> Result<u64> {
     let file_data_raw = fs::read(filename).context("Reading file")?;
     let filesize = file_data_raw.len() as u32;
 
@@ -172,6 +172,7 @@ fn send_file(port: &mut dyn serialport::SerialPort, filename: &str, debug: bool)
         1
     };
     let mut eof_sent = false;
+    let mut eof_acked = false;
     let start_time = Instant::now();
 
     while send_idx < total_frames {
@@ -238,6 +239,7 @@ fn send_file(port: &mut dyn serialport::SerialPort, filename: &str, debug: bool)
                     }
                 }
                 if acked_seq == eof_seq {
+                    eof_acked = true;
                     send_idx = total_frames;
                 }
                 pb.set_position(send_idx as u64);
@@ -267,8 +269,32 @@ fn send_file(port: &mut dyn serialport::SerialPort, filename: &str, debug: bool)
         port.flush()?;
     }
 
-    // Wait for final EOF ACK
-    let _ = recv_control(port, Duration::from_secs(2));
+    // Wait for the EOF ACK, properly.
+    //
+    // The receiver flushes its buffer to disk BEFORE acknowledging the EOF
+    // frame, so this ACK can lag by seconds. It only lands here when the
+    // frame count is an exact multiple of WIN_SIZE: the window ACK and the
+    // EOF ACK are then two separate messages, the loop above exits on the
+    // window ACK, and the EOF ACK arrives after it. Any other frame count
+    // and the loop has already consumed it.
+    //
+    // This used to be a 2s courtesy wait whose result was discarded, which
+    // meant FIN went out while the Z80 was still writing — the receiver
+    // then answered the stale ACK sequence instead of echoing FIN.
+    while !eof_acked {
+        match recv_control(port, Duration::from_secs(30)) {
+            Ok(Control::Ack(_)) => eof_acked = true,
+            Ok(Control::Rdy) => continue, // keepalive during a disk flush
+            Ok(Control::Nak(nak_seq)) => {
+                bail!("receiver NAKed seq {nak_seq} after the EOF frame")
+            }
+            Ok(Control::Can) => bail!("receiver cancelled before acknowledging EOF"),
+            Ok(Control::Fin) => bail!("receiver sent FIN before acknowledging EOF"),
+            Err(_) => bail!(
+                "no EOF ACK within 30s — the receiver may still be writing to disk"
+            ),
+        }
+    }
 
     let elapsed = start_time.elapsed().as_secs_f64();
     let throughput = filesize as f64 / elapsed;

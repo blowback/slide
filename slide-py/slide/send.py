@@ -77,6 +77,7 @@ def send_file(ser, filename: str, debug: bool = False):
     send_idx = 0
     eof_seq = (frames[-1][0] + 1) & 0xFF if frames else 1
     eof_sent = False
+    eof_acked = False
     start_time = time.time()
 
     while send_idx < total_frames:
@@ -131,6 +132,7 @@ def send_file(ser, filename: str, debug: bool = False):
                 if fseq == acked_seq:
                     break
             if acked_seq == eof_seq:
+                eof_acked = True
                 send_idx = total_frames
 
             pct = send_idx * 100 // total_frames
@@ -151,11 +153,38 @@ def send_file(ser, filename: str, debug: bool = False):
         ser.write(eof_frame)
         ser.flush()
 
-    # Wait for final EOF ACK
-    try:
-        ctrl, _ = recv_control(ser, timeout=2.0)
-    except TimeoutError:
-        pass
+    # Wait for the EOF ACK, properly.
+    #
+    # The receiver flushes its buffer to disk BEFORE acknowledging the EOF
+    # frame, so this ACK can lag by seconds. It only lands here when the
+    # frame count is an exact multiple of WIN_SIZE: the window ACK and the
+    # EOF ACK are then two separate messages, the loop above exits on the
+    # window ACK, and the EOF ACK arrives after it. Any other frame count
+    # and the loop has already consumed it.
+    #
+    # This used to be a 2s courtesy wait whose result was discarded, which
+    # meant FIN went out while the Z80 was still writing — the receiver then
+    # answered the stale ACK sequence instead of echoing FIN.
+    while not eof_acked:
+        try:
+            ctrl, ack_seq = recv_control(ser, timeout=30.0)
+        except TimeoutError:
+            print("\n  ERROR: no EOF ACK within 30s — the receiver may still "
+                  "be writing to disk")
+            return False
+        if ctrl == CTRL_RDY:
+            continue                     # keepalive during a disk flush
+        if ctrl == CTRL_ACK:
+            eof_acked = True
+        elif ctrl == CTRL_NAK:
+            print(f"\n  ERROR: receiver NAKed seq {ack_seq} after the EOF frame")
+            return False
+        elif ctrl == CTRL_CAN:
+            print("\n  ERROR: receiver cancelled before acknowledging EOF")
+            return False
+        else:
+            print(f"\n  ERROR: expected EOF ACK, got 0x{ctrl:02X}")
+            return False
 
     elapsed = time.time() - start_time
     throughput = filesize / elapsed if elapsed > 0 else 0
