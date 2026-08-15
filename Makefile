@@ -43,7 +43,7 @@ clean:
 	rm -f slide.com slidiag.com slide.lst slidiag.lst reset.com reset.lst
 
 disk: slide.com slidiag.com reset.com
-	$(MKFS) $(MKFSOPTS) $(CPM_IMAGE)
+	$(MKFS) $(MKFS_OPTS) $(CPM_IMAGE)
 	$(CP) $(CP_OPTS) $(CPM_IMAGE) slide.com 0:slide.com
 	$(CP) $(CP_OPTS) $(CPM_IMAGE) slidiag.com 0:slidiag.com
 	$(CP) $(CP_OPTS) $(CPM_IMAGE) reset.com 0:reset.com
