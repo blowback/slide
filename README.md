@@ -103,6 +103,39 @@ You can send multiple files in one go:
 slide send /dev/ttyUSB0 TEST1K.dat TEST2K.dat TEST4K.dat
 ```
 
+### Loading straight into VideoBeast
+
+If you have the VideoBeast expansion, `slide rv` will put a transferred file
+directly into video RAM instead of on disk:
+
+```
+slide rv
+```
+
+A file goes to video RAM when its name is exactly `vXXXXX.vbm`, where `XXXXX` is
+a five-digit hex byte address. Five digits cover `00000`-`FFFFF`, which is
+exactly the 1MB of video RAM. Case doesn't matter. Anything else in the same
+session — `TEST1K.dat`, `FONT.CH8` — is written to disk as usual, so one session
+can mix the two:
+
+```
+slide send /dev/ttyUSB0 v08100.vbm TEST1K.dat v40000.vbm
+```
+
+The sender needs no special support: the destination is carried entirely in the
+filename, so any existing SLIDE sender can drive it. Without the `v` flag
+`slide r` treats `v08100.vbm` as an ordinary filename and writes it to disk, as
+does `slide rv` for a name that isn't the exact pattern.
+
+To load a font over the standard one at `0x8100` — the `VLOAD CUSHION.CH8 x8100`
+example from the MicroBeast utilities — copy it to `v08100.vbm` on the PC and
+send that.
+
+SLIDE restores the card's register lock, mode register and window base after
+each write, so it leaves the display as it found it. A file that would run off
+the top of video RAM is refused before any of it is written and the transfer is
+cancelled.
+
 ### Sending files from MicroBeast to PC 
 
 It works in reverse too: this time we use "send" mode on the MicroBeast:

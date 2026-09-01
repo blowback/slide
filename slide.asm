@@ -134,6 +134,26 @@ RXBUF           EQU	0x8000           ; 4KB buffer (used for both send and receiv
 RXBUF_END       EQU	RXBUF + FLUSH_SIZE
 CRC_TABLE       EQU	0x9000           ; 512 bytes for CRC-16-CCITT lookup table
 
+; --- VideoBeast (receive mode "RV") ------------------------------------------
+; The card appears as a 16KB window in CPU page 1 once physical page 0x40 is
+; mapped there. Its top two bytes are always registers, and while registers are
+; unlocked the whole top 256 bytes of the window are. We sidestep that entirely
+; by writing through only the LOW 4KB of the window, exactly as VLOAD.COM does:
+; VB_PAGE_0 holds videoaddr>>12 and the host offset is 0x4000+(videoaddr&0xFFF),
+; so the copy never reaches 0x7F00 and every byte of the 1MB stays reachable.
+; A 4KB flush therefore costs at most one window move, same as a 16KB window
+; would, and no address needs special-casing.
+IO_PAGE_1       EQU	0x71             ; MicroBeast page-map port for 0x4000-0x7FFF
+VB_PHYS_PAGE    EQU	0x40             ; physical page number of the VideoBeast
+VB_UNLOCK       EQU	0xF3             ; write to VB_LOCK to allow register writes
+VBASE           EQU	0x4000           ; CPU page 1
+VB_MODE         EQU	VBASE + 0x3FFF   ; always accessible
+VB_LOCK         EQU	VBASE + 0x3FFE   ; always accessible
+VB_PAGE_0       EQU	VBASE + 0x3FF9   ; window base in 4KB units (needs unlock)
+VB_SLICE_END    EQU	VBASE + 0x1000   ; end of the 4KB slice we write through
+VID_RAM_TOP     EQU	0x10             ; 1MB video RAM, in units of 64KB
+MBB_GET_PAGE    EQU	0xFDDC           ; BeastOS BIOS: C = CPU page -> A = phys page
+
 ; ============================================================================
 ; Entry point
 ; ============================================================================
@@ -161,6 +181,10 @@ entry
                 JR	NZ, .do_send
 
                 ; --- receive mode ---
+                ; Same bytes on the wire whether or not "V" was given: this
+                ; runs before send_wakeup, and uart_tx stalls ~330ms per byte
+                ; while CTS is low, so extra text here eats the host's
+                ; handshake window. show_vid_target reports the mode per file.
                 LD	DE, msg_banner_recv
                 CALL	print_user_msg
                 CALL	recv_session
@@ -209,9 +233,9 @@ parse_cmdline
 .got_char
                 ; check for 'R' or 'r'
                 CP	'R'
-                RET	Z               ; explicit receive mode
+                JR	Z, .recv_mode   ; explicit receive mode
                 CP	'r'
-                RET	Z
+                JR	Z, .recv_mode
 
                 ; check for 'S' or 's'
                 CP	'S'
@@ -220,6 +244,22 @@ parse_cmdline
                 JR	Z, .send_mode
 
                 ; unknown → receive mode
+                RET
+
+.recv_mode
+                ; "RV" (no separating space) selects VideoBeast receive mode.
+                ; Anything else following the R is ignored, as it always was.
+                DEC	B
+                RET	Z               ; bare "R"
+                INC	HL
+                LD	A, (HL)
+                CP	'V'
+                JR	Z, .video_mode
+                CP	'v'
+                RET	NZ
+.video_mode
+                LD	A, 1
+                LD	(vid_flag), A
                 RET
 
 .send_mode
@@ -256,6 +296,7 @@ parse_cmdline
                 RET
 
 mode            DB	0               ; 0=receive, 1=send
+vid_flag        DB	0               ; 1 = "RV": magic filenames target VideoBeast
 send_fname      DS	13              ; null-terminated filename for send mode
 cmdtail_buf     DS	128             ; saved command tail (filenames)
 cmdtail_pos     DW	0               ; current position in cmdtail_buf
@@ -952,6 +993,7 @@ recv_session
                 ; signature so the host knows SLIDE.COM is alive (v0.2.1 §1)
                 XOR	A
                 LD	(can_initiated), A
+                LD	(vid_active), A
                 CALL	send_wakeup
 
                 ; --- Handshake: wait for PC's RDY, echo back ---
@@ -1009,20 +1051,38 @@ recv_session
                 ; parse filename from header payload
                 CALL	parse_filename
 
+                ; choose the destination: VideoBeast when we are in "RV" mode
+                ; and the name is the magic vXXXXXX.vbm, otherwise disk as before
+                CALL	select_dest
+                JR	C, .err_video
+
+                LD	A, (vid_active)
+                OR	A
+                JR	NZ, .dest_ready ; video RAM needs no directory entry
+
                 ; create output file
                 CALL	create_file
                 JR	C, .err_file
 
+.dest_ready
                 ; ACK header (seq 0)
                 LD	A, 0
                 CALL	send_ack
+
+                ; report the decoded address only once the header is ACKed, so
+                ; the text never sits between the header frame and its ACK
+                LD	A, (vid_active)
+                OR	A
+                CALL	NZ, show_vid_target
 
                 ; receive file data
                 CALL	recv_file
                 PUSH	AF              ; save error flag
 
-                ; close file (always, even on error)
-                CALL	close_file
+                ; close file (always, even on error) — nothing to close for video
+                LD	A, (vid_active)
+                OR	A
+                CALL	Z, close_file
 
                 POP	AF
                 JR	C, .file_error  ; recv_file failed — exit session
@@ -1085,6 +1145,11 @@ recv_session
 .err_file
                 LD	DE, msg_err_file
                 CALL	print_user_msg
+                CALL	send_can
+                RET
+
+.err_video
+                ; select_dest has already printed the reason
                 CALL	send_can
                 RET
 
@@ -2080,7 +2145,7 @@ recv_file
                 SBC	HL, DE
                 JR	C, .no_flush
 
-                CALL	flush_to_disk
+                CALL	flush_dest
                 JR	C, .disk_error
                 LD	HL, RXBUF
                 LD	(buf_ptr), HL
@@ -2144,7 +2209,7 @@ recv_file
                 LD	A, H
                 OR	L
                 JR	Z, .eof_ack
-                CALL	flush_to_disk
+                CALL	flush_dest
                 JR	C, .disk_error
 
 .eof_ack
@@ -2240,6 +2305,446 @@ flush_to_disk
                 CALL	print_user_msg
                 SCF
                 RET
+
+; ============================================================================
+; VIDEOBEAST DESTINATION (receive mode "RV")
+;
+; In "RV" mode a file whose name is exactly vXXXXX.vbm (case-insensitive,
+; XXXXX = five hex digits, the full 0x00000-0xFFFFF of video RAM) is written
+; straight into VideoBeast video RAM at byte address XXXXX instead of to disk. Any other name, or plain "R" mode,
+; goes to disk exactly as before — so an unmodified sender drives either
+; destination just by choosing the filename, and one session can mix both.
+;
+; The running write cursor is held split the way the hardware wants it:
+;   vid_page = videoaddr >> 12          -> VB_PAGE_0 (4KB units)
+;   vid_off  = 0x4000 + (videoaddr & 0x0FFF)  -> host address in CPU page 1
+; Only the low 4KB of the 16KB window is ever written, which keeps the copy
+; away from the register shadow at the top of the window (see VB_* above).
+; ============================================================================
+
+; ============================================================================
+; select_dest — decide where this file's payload goes. Call after
+; parse_filename (which fills the FCB and file_size) and before create_file.
+;
+; Exit: carry clear, vid_active = 1 -> VideoBeast, cursor set up
+;       carry clear, vid_active = 0 -> disk, as before
+;       carry set                   -> magic name, but the file would run off
+;                                      the top of video RAM; already reported
+; ============================================================================
+select_dest
+                XOR	A
+                LD	(vid_active), A
+                LD	A, (vid_flag)
+                OR	A
+                RET	Z               ; plain "R" — always disk
+
+                CALL	parse_vidname
+                OR	A
+                RET	Z               ; ordinary name — disk
+
+                CALL	check_vid_range
+                JR	C, .too_big
+
+                LD	A, 1
+                LD	(vid_active), A
+                OR	A               ; A = 1, clears carry
+                RET
+
+.too_big
+                LD	DE, msg_err_vidrange
+                CALL	print_user_msg
+                SCF
+                RET
+
+; ============================================================================
+; parse_vidname — match the magic filename at RXBUF.
+; RXBUF holds the null-terminated name from the header frame; this only reads
+; it, so parse_filename may run before or after.
+;
+; Five hex digits span 0x00000-0xFFFFF, which is exactly the 1MB of video RAM,
+; so any name of the right shape carries a usable address — there is nothing to
+; range-check here. A six-digit name simply fails the '.' test and goes to disk.
+;
+; Exit: A = 0 -> not a video name
+;       A = 1 -> matched; vid_page / vid_off set
+; Trashes A, BC, DE, HL.
+; ============================================================================
+parse_vidname
+                LD	DE, RXBUF
+                LD	A, (DE)
+                INC	DE
+                CALL	vid_tolower
+                CP	'v'
+                JP	NZ, .nomatch
+
+                ; five hex digits, most significant first, into C:HL
+                LD	HL, 0
+                LD	C, 0
+                LD	B, 5
+.hex_loop
+                LD	A, (DE)
+                INC	DE
+                CALL	vid_hexval
+                JP	C, .nomatch     ; not a hex digit — an ordinary name
+                ADD	HL, HL
+                RL	C
+                ADD	HL, HL
+                RL	C
+                ADD	HL, HL
+                RL	C
+                ADD	HL, HL
+                RL	C
+                OR	L
+                LD	L, A
+                DJNZ	.hex_loop
+
+                ; ".vbm", then end of string
+                LD	A, (DE)
+                INC	DE
+                CP	'.'
+                JP	NZ, .nomatch
+                LD	A, (DE)
+                INC	DE
+                CALL	vid_tolower
+                CP	'v'
+                JP	NZ, .nomatch
+                LD	A, (DE)
+                INC	DE
+                CALL	vid_tolower
+                CP	'b'
+                JR	NZ, .nomatch
+                LD	A, (DE)
+                INC	DE
+                CALL	vid_tolower
+                CP	'm'
+                JR	NZ, .nomatch
+                LD	A, (DE)
+                OR	A
+                JR	NZ, .nomatch    ; trailing junk
+
+                ; split C:HL into a 4KB page number and an offset in the window
+                LD	A, H
+                RRCA
+                RRCA
+                RRCA
+                RRCA
+                AND	0x0F            ; bits 15-12
+                LD	B, A
+                LD	A, C
+                RLCA
+                RLCA
+                RLCA
+                RLCA
+                AND	0xF0            ; bits 19-16
+                OR	B
+                LD	(vid_page), A
+
+                LD	A, H
+                AND	0x0F
+                OR	0x40            ; window base 0x4000
+                LD	H, A
+                LD	(vid_off), HL
+
+                LD	A, 1
+                RET
+
+.nomatch
+                XOR	A
+                RET
+
+; ============================================================================
+; vid_tolower — fold A to lower case. Preserves BC, DE, HL.
+; ============================================================================
+vid_tolower
+                CP	'A'
+                RET	C
+                CP	'Z' + 1
+                RET	NC
+                OR	0x20
+                RET
+
+; ============================================================================
+; vid_hexval — A = hex digit -> A = 0..15, carry clear.
+; Carry set if A is not a hex digit. Preserves BC, DE, HL.
+; ============================================================================
+vid_hexval
+                CP	'0'
+                RET	C               ; below '0' — invalid
+                CP	'9' + 1
+                JR	NC, .alpha
+                SUB	'0'
+                RET                     ; 0-9, carry clear
+.alpha
+                OR	0x20            ; fold to lower case
+                CP	'a'
+                RET	C               ; between '9' and 'a' — invalid
+                CP	'f' + 1
+                CCF
+                RET	C               ; above 'f' — invalid
+                SUB	'a' - 10
+                RET
+
+; ============================================================================
+; check_vid_range — reject a file that would run off the top of video RAM.
+; Uses file_size from the header frame. Carry set = too big.
+; Trashes A, BC, DE, HL.
+; ============================================================================
+check_vid_range
+                LD	A, (file_size + 3)
+                OR	A
+                JR	NZ, .bad        ; 16MB or more — no need to look further
+
+                ; rebuild the 20-bit start address as E:HL
+                LD	HL, (vid_off)
+                LD	A, H
+                AND	0x0F            ; drop the 0x4000 window base
+                LD	H, A
+                LD	A, (vid_page)
+                LD	E, A
+                AND	0x0F
+                RLCA
+                RLCA
+                RLCA
+                RLCA                    ; page bits 3-0 -> address bits 15-12
+                OR	H
+                LD	H, A
+                LD	A, E
+                RRCA
+                RRCA
+                RRCA
+                RRCA
+                AND	0x0F
+                LD	E, A            ; E = start >> 16
+
+                ; end = start + file_size, in 24 bits
+                LD	BC, (file_size)
+                ADD	HL, BC
+                LD	A, (file_size + 2)
+                ADC	A, E
+                JR	C, .bad         ; carried out of 24 bits
+                CP	VID_RAM_TOP
+                JR	C, .ok
+                JR	NZ, .bad
+                LD	A, H            ; exactly 0x100000 is the one allowed end
+                OR	L
+                JR	NZ, .bad
+.ok
+                OR	A
+                RET
+.bad
+                SCF
+                RET
+
+; ============================================================================
+; show_vid_target — tell the user where this file is going.
+; Trashes A, DE, HL.
+; ============================================================================
+show_vid_target
+                LD	HL, vid_target_txt
+                LD	A, (vid_page)
+                RRCA
+                RRCA
+                RRCA
+                RRCA
+                CALL	.digit          ; address bits 19-16
+                LD	A, (vid_page)
+                CALL	.digit          ; bits 15-12
+                LD	A, (vid_off + 1)
+                CALL	.digit          ; bits 11-8
+                LD	A, (vid_off)
+                RRCA
+                RRCA
+                RRCA
+                RRCA
+                CALL	.digit          ; bits 7-4
+                LD	A, (vid_off)
+                CALL	.digit          ; bits 3-0
+                LD	DE, msg_vid_target
+                JP	print_user_msg
+
+.digit
+                AND	0x0F
+                CP	10
+                JR	C, .num
+                ADD	A, 'A' - 10
+                JR	.put
+.num
+                ADD	A, '0'
+.put
+                LD	(HL), A
+                INC	HL
+                RET
+
+; ============================================================================
+; flush_dest — send the buffered payload to whichever destination this file
+; selected. Same contract as flush_to_disk: carry set on error.
+; ============================================================================
+flush_dest
+                LD	A, (vid_active)
+                OR	A
+                JP	NZ, flush_to_video
+                JP	flush_to_disk
+
+; ============================================================================
+; Flush buffer to VideoBeast video RAM.
+;
+; Copies buf_used bytes from RXBUF to the running cursor, moving the window
+; every time the 4KB slice fills. Unlike the disk path there is no record
+; padding: exactly buf_used bytes are written, so a partial final flush leaves
+; the bytes past the end of the file untouched.
+;
+; Carry set on error (ran off the top of video RAM — should be unreachable,
+; check_vid_range rejects such files up front).
+; ============================================================================
+flush_to_video
+                LD	HL, (buf_used)
+                LD	A, H
+                OR	L
+                RET	Z               ; nothing buffered, carry clear
+                LD	(vid_left), HL
+                LD	HL, RXBUF
+                LD	(vid_src), HL
+
+                CALL	vid_map_in
+
+.chunk
+                ; how much room is left in the 4KB slice: 1..0x1000
+                LD	HL, VB_SLICE_END
+                LD	DE, (vid_off)
+                OR	A
+                SBC	HL, DE
+
+                ; chunk = min(vid_left, room)
+                LD	BC, (vid_left)
+                PUSH	HL
+                OR	A
+                SBC	HL, BC
+                POP	HL
+                JR	NC, .have_chunk ; room >= left, so copy all of it
+                LD	B, H
+                LD	C, L            ; otherwise fill the slice
+.have_chunk
+                LD	(vid_chunk), BC
+
+                LD	A, (vid_page)
+                LD	(VB_PAGE_0), A
+
+                LD	HL, (vid_src)
+                LDIR
+                LD	(vid_src), HL
+                LD	(vid_off), DE
+
+                LD	HL, (vid_left)
+                LD	BC, (vid_chunk)
+                OR	A
+                SBC	HL, BC
+                LD	(vid_left), HL
+
+                ; if the slice filled exactly, step the window on 4KB
+                LD	A, D
+                CP	VB_SLICE_END >> 8
+                JR	NZ, .more
+                LD	HL, VBASE
+                LD	(vid_off), HL
+                LD	A, (vid_page)
+                INC	A
+                LD	(vid_page), A
+
+.more
+                LD	HL, (vid_left)
+                LD	A, H
+                OR	L
+                JR	Z, .done
+
+                ; Still data to place. Getting here means the slice filled and
+                ; the page was just incremented, so page 0 can only mean it
+                ; wrapped off the top of the 1MB.
+                LD	A, (vid_page)
+                OR	A
+                JR	NZ, .chunk
+
+                CALL	vid_map_out
+                LD	DE, msg_err_vidrange
+                CALL	print_user_msg
+                SCF
+                RET
+
+.done
+                CALL	vid_map_out
+                OR	A
+                RET
+
+; ============================================================================
+; vid_map_in — page the VideoBeast into CPU page 1 and save everything we are
+; about to change: the CPU page mapping, the register lock, the display mode
+; (forced to 1x16KB window mapping) and the window base.
+;
+; Interrupts are off from here until vid_map_out: an ISR living outside page 1
+; could otherwise touch 0x4000-0x7FFF while the card is mapped there. Nothing
+; in SLIDE lives in that range — code sits at 0x0100, buffers at 0x8000, and
+; the CP/M stack is up in high memory — so the copy itself is unaffected.
+;
+; Trashes A, and whatever MBB_GET_PAGE trashes.
+; ============================================================================
+vid_map_in
+                DI
+                PUSH	BC
+                PUSH	DE
+                PUSH	HL
+                LD	C, 1            ; CPU page 1 = 0x4000-0x7FFF
+                CALL	MBB_GET_PAGE
+                LD	(vid_old_page), A
+                POP	HL
+                POP	DE
+                POP	BC
+
+                LD	A, VB_PHYS_PAGE
+                OUT	(IO_PAGE_1), A
+
+                LD	A, (VB_LOCK)
+                LD	(vid_old_lock), A
+                LD	A, VB_UNLOCK
+                LD	(VB_LOCK), A
+
+                LD	A, (VB_MODE)
+                LD	(vid_old_mode), A
+                AND	0x0F            ; clear the map-mode bits: 1 x 16KB window
+                LD	(VB_MODE), A
+
+                LD	A, (VB_PAGE_0)
+                LD	(vid_old_p0), A
+                RET
+
+; ============================================================================
+; vid_map_out — undo vid_map_in, leaving the card exactly as we found it.
+; Trashes A.
+; ============================================================================
+vid_map_out
+                LD	A, (vid_old_p0)
+                LD	(VB_PAGE_0), A
+
+                LD	A, (vid_old_mode)
+                LD	(VB_MODE), A
+
+                LD	A, (vid_old_lock)
+                LD	(VB_LOCK), A
+
+                LD	A, (vid_old_page)
+                OUT	(IO_PAGE_1), A
+                EI
+                RET
+
+; --- video destination state ---
+vid_active      DB	0               ; 1 = this file goes to VideoBeast
+vid_page        DB	0               ; window base, in 4KB units
+vid_off         DW	VBASE           ; host write address, 0x4000-0x4FFF
+vid_left        DW	0               ; bytes still to copy this flush
+vid_src         DW	RXBUF           ; read cursor within RXBUF
+vid_chunk       DW	0               ; bytes in the chunk being copied
+vid_old_page    DB	0               ; saved CPU page 1 mapping
+vid_old_lock    DB	0               ; saved VideoBeast register lock
+vid_old_mode    DB	0               ; saved VideoBeast mode register
+vid_old_p0      DB	0               ; saved VideoBeast window base
 
 ; ============================================================================
 ; SEND SESSION (multi-file from command line)
@@ -3038,4 +3543,7 @@ msg_dbg_crc     DB	"DBG: CRC mismatch cmp/prs: ", '$'
 msg_dbg_tmo     DB	"DBG: timeout in payload", 13, 10, '$'
 msg_err_abort   DB	13, 10, "Transfer aborted - connection lost", 13, 10, '$'
 msg_cancelled   DB	13, 10, "Transfer cancelled by peer", 13, 10, '$'
+msg_vid_target  DB	13, 10, "VideoBeast @ "
+vid_target_txt  DB	"00000", 13, 10, '$'
+msg_err_vidrange DB	13, 10, "Error: file overruns video RAM", 13, 10, '$'
                 END	entry
