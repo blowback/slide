@@ -136,6 +136,30 @@ each write, so it leaves the display as it found it. A file that would run off
 the top of video RAM is refused before any of it is written and the transfer is
 cancelled.
 
+#### Palettes
+
+A second pattern, `vPB.vbp`, loads a colour palette. `P` is the palette number,
+`0` or `1`; `B` is the starting bank, `0` to `3`. So `v03.vbp` means palette 0,
+bank 3:
+
+```
+slide send /dev/ttyUSB0 v00.vbp
+```
+
+The card has two independent palettes of 256 colours. Each is four banks of 64
+ARGB1555 entries — 128 bytes a bank, 512 bytes a palette — and the CPU sees one
+bank at a time through a 128-byte window in the register area. SLIDE fills the
+named bank, steps to the next, and keeps going to bank 3.
+
+It stops there. Loading never wraps from bank 3 back to bank 0, and never
+crosses from one palette to the other, so anything past the end of the named
+palette is discarded — send `v00.vbp` for a full 512-byte palette, or
+`v02.vbp` to replace just the top two banks. The transfer still completes
+normally; the surplus simply goes nowhere.
+
+Palette loading only touches the lower-window selector, which it restores
+afterwards. It leaves the mode register and window base alone.
+
 ### Sending files from MicroBeast to PC 
 
 It works in reverse too: this time we use "send" mode on the MicroBeast:

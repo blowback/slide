@@ -10,6 +10,7 @@
 ;
 ; Usage:  SLIDE              — receive mode (default)
 ;         SLIDE R            — receive mode (explicit)
+;         SLIDE RV           — receive mode, VideoBeast destinations enabled
 ;         SLIDE S FILE.COM   — send FILE.COM to PC
 ;         SLIDE S A.COM B.DAT — send multiple files
 ;
@@ -150,6 +151,10 @@ VBASE           EQU	0x4000           ; CPU page 1
 VB_MODE         EQU	VBASE + 0x3FFF   ; always accessible
 VB_LOCK         EQU	VBASE + 0x3FFE   ; always accessible
 VB_PAGE_0       EQU	VBASE + 0x3FF9   ; window base in 4KB units (needs unlock)
+VB_LOWER_REGS   EQU	VBASE + 0x3FF5   ; [2] palette select, [1:0] bank (needs unlock)
+VB_PALETTE      EQU	VBASE + 0x3F00   ; 64 x 2-byte ARGB1555 entries (needs unlock)
+PAL_PAGE        EQU	128              ; bytes per palette bank (64 entries)
+PAL_BANKS       EQU	4                ; banks per palette
 VB_SLICE_END    EQU	VBASE + 0x1000   ; end of the 4KB slice we write through
 VID_RAM_TOP     EQU	0x10             ; 1MB video RAM, in units of 64KB
 MBB_GET_PAGE    EQU	0xFDDC           ; BeastOS BIOS: C = CPU page -> A = phys page
@@ -1073,7 +1078,7 @@ recv_session
                 ; the text never sits between the header frame and its ACK
                 LD	A, (vid_active)
                 OR	A
-                CALL	NZ, show_vid_target
+                CALL	NZ, show_dest
 
                 ; receive file data
                 CALL	recv_file
@@ -2326,9 +2331,10 @@ flush_to_disk
 ; select_dest — decide where this file's payload goes. Call after
 ; parse_filename (which fills the FCB and file_size) and before create_file.
 ;
-; Exit: carry clear, vid_active = 1 -> VideoBeast, cursor set up
-;       carry clear, vid_active = 0 -> disk, as before
-;       carry set                   -> magic name, but the file would run off
+; Exit: carry clear, vid_active = 0 -> disk, as before
+;       carry clear, vid_active = 1 -> VideoBeast video RAM, cursor set up
+;       carry clear, vid_active = 2 -> VideoBeast palette, cursor set up
+;       carry set                   -> vXXXXX.vbm, but the file would run off
 ;                                      the top of video RAM; already reported
 ; ============================================================================
 select_dest
@@ -2340,8 +2346,18 @@ select_dest
 
                 CALL	parse_vidname
                 OR	A
+                JR	NZ, .video
+
+                CALL	parse_palname
+                OR	A
                 RET	Z               ; ordinary name — disk
 
+                LD	A, 2
+                LD	(vid_active), A
+                OR	A               ; A = 2, clears carry
+                RET
+
+.video
                 CALL	check_vid_range
                 JR	C, .too_big
 
@@ -2581,9 +2597,21 @@ show_vid_target
 ; ============================================================================
 flush_dest
                 LD	A, (vid_active)
-                OR	A
-                JP	NZ, flush_to_video
+                DEC	A
+                JP	Z, flush_to_video
+                DEC	A
+                JP	Z, flush_to_palette
                 JP	flush_to_disk
+
+; ============================================================================
+; show_dest — report the destination this file picked. Only called when
+; vid_active is non-zero, so the disk case never reaches here.
+; ============================================================================
+show_dest
+                LD	A, (vid_active)
+                DEC	A
+                JP	Z, show_vid_target
+                JP	show_pal_target
 
 ; ============================================================================
 ; Flush buffer to VideoBeast video RAM.
@@ -2675,18 +2703,242 @@ flush_to_video
                 RET
 
 ; ============================================================================
-; vid_map_in — page the VideoBeast into CPU page 1 and save everything we are
-; about to change: the CPU page mapping, the register lock, the display mode
-; (forced to 1x16KB window mapping) and the window base.
+; parse_palname — match the palette filename at RXBUF: vPB.vbp
 ;
-; Interrupts are off from here until vid_map_out: an ISR living outside page 1
+; P is the palette number, 0 or 1. B is the starting bank, 0-3. Each bank is
+; 64 ARGB1555 entries / 128 bytes, and a palette is 4 banks / 512 bytes. The
+; card shows one bank at a time through the 128-byte window at VB_PALETTE;
+; VB_LOWER_REGS selects which.
+;
+; Loading runs forward from the named bank to bank 3 and stops there: it never
+; wraps to bank 0, and never crosses from one palette to the other. pal_left
+; is set to that remaining capacity, so surplus data is simply dropped.
+;
+; Exit: A = 0 -> not a palette name
+;       A = 1 -> matched; pal_sel / pal_bank / pal_off / pal_left set
+; Trashes A, BC, DE, HL.
+; ============================================================================
+parse_palname
+                LD	DE, RXBUF
+                LD	A, (DE)
+                INC	DE
+                CALL	vid_tolower
+                CP	'v'
+                JR	NZ, .nomatch
+
+                LD	A, (DE)         ; palette number, 0 or 1
+                INC	DE
+                SUB	'0'
+                CP	2
+                JR	NC, .nomatch
+                LD	B, A
+
+                LD	A, (DE)         ; starting bank, 0-3
+                INC	DE
+                SUB	'0'
+                CP	PAL_BANKS
+                JR	NC, .nomatch
+                LD	C, A
+
+                LD	A, (DE)         ; ".vbp", then end of string
+                INC	DE
+                CP	'.'
+                JR	NZ, .nomatch
+                LD	A, (DE)
+                INC	DE
+                CALL	vid_tolower
+                CP	'v'
+                JR	NZ, .nomatch
+                LD	A, (DE)
+                INC	DE
+                CALL	vid_tolower
+                CP	'b'
+                JR	NZ, .nomatch
+                LD	A, (DE)
+                INC	DE
+                CALL	vid_tolower
+                CP	'p'
+                JR	NZ, .nomatch
+                LD	A, (DE)
+                OR	A
+                JR	NZ, .nomatch    ; trailing junk
+
+                LD	A, B
+                LD	(pal_sel), A
+                LD	A, C
+                LD	(pal_bank), A
+                XOR	A
+                LD	(pal_off), A
+
+                ; capacity = (PAL_BANKS - bank) * PAL_PAGE, no wrap past bank 3
+                LD	A, PAL_BANKS
+                SUB	C
+                LD	L, A
+                LD	H, 0
+                ADD	HL, HL
+                ADD	HL, HL
+                ADD	HL, HL
+                ADD	HL, HL
+                ADD	HL, HL
+                ADD	HL, HL
+                ADD	HL, HL          ; x128
+                LD	(pal_left), HL
+
+                LD	A, 1
+                RET
+
+.nomatch
+                XOR	A
+                RET
+
+; ============================================================================
+; show_pal_target — tell the user which palette and bank this file is going to.
+; Trashes A, DE, HL.
+; ============================================================================
+show_pal_target
+                LD	A, (pal_sel)
+                ADD	A, '0'
+                LD	(pal_target_sel), A
+                LD	A, (pal_bank)
+                ADD	A, '0'
+                LD	(pal_target_bank), A
+                LD	DE, msg_pal_target
+                JP	print_user_msg
+
+; ============================================================================
+; Flush buffer to a VideoBeast palette.
+;
+; Places bytes a bank at a time through the 128-byte palette window, stepping
+; VB_LOWER_REGS on at each bank boundary. Once pal_left reaches zero the file
+; has filled every bank up to bank 3 and the rest of it is discarded — the
+; frames are still received and ACKed, they just go nowhere.
+;
+; Always succeeds: carry clear.
+; ============================================================================
+flush_to_palette
+                LD	HL, (buf_used)
+                LD	A, H
+                OR	L
+                RET	Z               ; nothing buffered
+
+                LD	BC, (pal_left)
+                LD	A, B
+                OR	C
+                RET	Z               ; every bank filled — ignore the surplus
+
+                ; take = min(buf_used, pal_left)
+                PUSH	HL
+                OR	A
+                SBC	HL, BC
+                POP	HL
+                JR	C, .have_take   ; buf_used < pal_left
+                LD	H, B
+                LD	L, C
+.have_take
+                LD	(pal_take), HL
+
+                EX	DE, HL          ; DE = take
+                LD	HL, (pal_left)
+                OR	A
+                SBC	HL, DE
+                LD	(pal_left), HL
+
+                LD	HL, RXBUF
+                LD	(pal_src), HL
+
+                CALL	pal_map_in
+
+.page_loop
+                LD	HL, (pal_take)
+                LD	A, H
+                OR	L
+                JR	Z, .done
+
+                ; room = PAL_PAGE - pal_off, always 1..128
+                LD	A, (pal_off)
+                LD	C, A
+                LD	A, PAL_PAGE
+                SUB	C
+                LD	B, A
+
+                ; chunk = min(take, room)
+                LD	A, H
+                OR	A
+                JR	NZ, .have_chunk ; take >= 256, so room is the smaller
+                LD	A, L
+                CP	B
+                JR	NC, .have_chunk
+                LD	B, A
+.have_chunk
+                LD	A, B
+                LD	(pal_chunk), A
+
+                ; point the lower window at palette pal_sel, bank pal_bank
+                LD	A, (pal_sel)
+                ADD	A, A
+                ADD	A, A            ; bit 2 selects the palette
+                LD	C, A
+                LD	A, (pal_bank)
+                OR	C
+                LD	(VB_LOWER_REGS), A
+
+                ; copy the chunk into the window at pal_off
+                LD	A, (pal_off)
+                LD	E, A
+                LD	D, VB_PALETTE >> 8
+                LD	HL, (pal_src)
+                LD	C, B
+                LD	B, 0
+                LDIR
+                LD	(pal_src), HL
+
+                ; advance, stepping to the next bank when this one fills
+                LD	A, (pal_chunk)
+                LD	C, A
+                LD	A, (pal_off)
+                ADD	A, C
+                CP	PAL_PAGE
+                JR	C, .same_bank
+                XOR	A
+                LD	(pal_off), A
+                LD	A, (pal_bank)
+                INC	A
+                LD	(pal_bank), A
+                JR	.took_chunk
+.same_bank
+                LD	(pal_off), A
+
+.took_chunk
+                LD	HL, (pal_take)
+                LD	A, (pal_chunk)
+                LD	C, A
+                LD	B, 0
+                OR	A
+                SBC	HL, BC
+                LD	(pal_take), HL
+                JR	.page_loop
+
+.done
+                CALL	pal_map_out
+                OR	A
+                RET
+
+; ============================================================================
+; vb_map_in — page the VideoBeast into CPU page 1 and unlock its registers,
+; saving the CPU page mapping and the previous lock state.
+;
+; Interrupts are off from here until vb_map_out: an ISR living outside page 1
 ; could otherwise touch 0x4000-0x7FFF while the card is mapped there. Nothing
 ; in SLIDE lives in that range — code sits at 0x0100, buffers at 0x8000, and
 ; the CP/M stack is up in high memory — so the copy itself is unaffected.
 ;
+; While unlocked the top 256 bytes of the window are the register file, not
+; video RAM. That is what the palette path writes through, and what the video
+; RAM path stays clear of by using only the low 4KB of the window.
+;
 ; Trashes A, and whatever MBB_GET_PAGE trashes.
 ; ============================================================================
-vid_map_in
+vb_map_in
                 DI
                 PUSH	BC
                 PUSH	DE
@@ -2705,6 +2957,27 @@ vid_map_in
                 LD	(vid_old_lock), A
                 LD	A, VB_UNLOCK
                 LD	(VB_LOCK), A
+                RET
+
+; ============================================================================
+; vb_map_out — relock and give CPU page 1 back. Trashes A.
+; ============================================================================
+vb_map_out
+                LD	A, (vid_old_lock)
+                LD	(VB_LOCK), A
+
+                LD	A, (vid_old_page)
+                OUT	(IO_PAGE_1), A
+                EI
+                RET
+
+; ============================================================================
+; vid_map_in / vid_map_out — as above, plus the two registers the video RAM
+; path changes: the display mode (forced to 1x16KB window mapping) and the
+; window base.
+; ============================================================================
+vid_map_in
+                CALL	vb_map_in
 
                 LD	A, (VB_MODE)
                 LD	(vid_old_mode), A
@@ -2715,10 +2988,6 @@ vid_map_in
                 LD	(vid_old_p0), A
                 RET
 
-; ============================================================================
-; vid_map_out — undo vid_map_in, leaving the card exactly as we found it.
-; Trashes A.
-; ============================================================================
 vid_map_out
                 LD	A, (vid_old_p0)
                 LD	(VB_PAGE_0), A
@@ -2726,16 +2995,27 @@ vid_map_out
                 LD	A, (vid_old_mode)
                 LD	(VB_MODE), A
 
-                LD	A, (vid_old_lock)
-                LD	(VB_LOCK), A
+                JP	vb_map_out
 
-                LD	A, (vid_old_page)
-                OUT	(IO_PAGE_1), A
-                EI
+; ============================================================================
+; pal_map_in / pal_map_out — as vb_map_in, plus the lower-window selector the
+; palette path changes. The mode register and window base are left alone:
+; the register file is reachable at the top of the window whatever the window
+; is mapped to, so there is no reason to disturb the display.
+; ============================================================================
+pal_map_in
+                CALL	vb_map_in
+                LD	A, (VB_LOWER_REGS)
+                LD	(pal_old_lower), A
                 RET
 
+pal_map_out
+                LD	A, (pal_old_lower)
+                LD	(VB_LOWER_REGS), A
+                JP	vb_map_out
+
 ; --- video destination state ---
-vid_active      DB	0               ; 1 = this file goes to VideoBeast
+vid_active      DB	0               ; 0 = disk, 1 = video RAM, 2 = palette
 vid_page        DB	0               ; window base, in 4KB units
 vid_off         DW	VBASE           ; host write address, 0x4000-0x4FFF
 vid_left        DW	0               ; bytes still to copy this flush
@@ -2745,6 +3025,16 @@ vid_old_page    DB	0               ; saved CPU page 1 mapping
 vid_old_lock    DB	0               ; saved VideoBeast register lock
 vid_old_mode    DB	0               ; saved VideoBeast mode register
 vid_old_p0      DB	0               ; saved VideoBeast window base
+
+; --- palette destination state ---
+pal_sel         DB	0               ; palette 0 or 1
+pal_bank        DB	0               ; bank 0-3 within that palette
+pal_off         DB	0               ; write offset within the current bank
+pal_left        DW	0               ; bytes we will still accept this file
+pal_take        DW	0               ; bytes being placed this flush
+pal_src         DW	RXBUF           ; read cursor within RXBUF
+pal_chunk       DB	0               ; bytes in the chunk being copied
+pal_old_lower   DB	0               ; saved lower-window selector
 
 ; ============================================================================
 ; SEND SESSION (multi-file from command line)
@@ -3546,4 +3836,7 @@ msg_cancelled   DB	13, 10, "Transfer cancelled by peer", 13, 10, '$'
 msg_vid_target  DB	13, 10, "VideoBeast @ "
 vid_target_txt  DB	"00000", 13, 10, '$'
 msg_err_vidrange DB	13, 10, "Error: file overruns video RAM", 13, 10, '$'
+msg_pal_target  DB	13, 10, "VideoBeast palette "
+pal_target_sel  DB	"0", " bank "
+pal_target_bank DB	"0", 13, 10, '$'
                 END	entry
